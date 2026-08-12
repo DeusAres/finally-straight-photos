@@ -166,7 +166,7 @@
     </div>
     <button id="exportBtn" class="primary" disabled>Esporta JPEG</button>
   </div>
-  <div class="hint">Trascina sull'immagine per tracciare una guida. Verde = verticale, giallo = orizzontale (dedotto dall'inclinazione). Max 2 per direzione.</div>
+  <div class="hint">Tocca e trascina per posizionare il punto (usa la loupe), rilascia per confermare — poi ripeti per il punto finale. Verde = verticale, giallo = orizzontale. Max 2 per direzione.</div>
   <div id="status"></div>
 </div>
 
@@ -176,7 +176,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.2.0';
+const VERSION = 'v0.3.0';
 document.getElementById('versionBadge').textContent = VERSION;
 
 /* ============================ mat3 utilities ============================ */
@@ -341,7 +341,6 @@ function drawGuides(){
   undoBtn.disabled = clearBtn.disabled = state.guides.length===0;
 }
 
-let drag = null;
 function viewPoint(e){
   const t = e.touches ? e.touches[0] : e;
   const r = viewport.getBoundingClientRect();
@@ -381,42 +380,69 @@ function updateLoupe(screenPt){
 }
 function hideLoupe(){ loupeEl.style.display = 'none'; }
 
+// ---- two-phase placement: each point is its own touch-drag-release gesture,
+// so the loupe is live and adjustable BEFORE either point is committed
+// (a single continuous drag can't do this for the start point, since it's
+// fixed at first contact — under your finger, unseen, before the loupe even appears) ----
+let pendingA = null;   // image-space {x,y} once point A is confirmed
+let phase = null;      // null | 'A' | 'B'
+let cur = null;        // live screen point during the current gesture
+
 function onDown(e){
   if(!state.bitmap) return;
   e.preventDefault();
-  const p = viewPoint(e);
-  drag = {start:p, cur:p};
-  updateLoupe(p);
+  cur = viewPoint(e);
+  phase = pendingA ? 'B' : 'A';
+  updateLoupe(cur);
+  drawLive();
 }
 function onMove(e){
-  if(!drag) return;
+  if(!phase) return;
   e.preventDefault();
-  drag.cur = viewPoint(e);
-  liveSvg.innerHTML =
-    `<line x1="${drag.start.x}" y1="${drag.start.y}" x2="${drag.cur.x}" y2="${drag.cur.y}"/>`;
-  updateLoupe(drag.cur);
+  cur = viewPoint(e);
+  updateLoupe(cur);
+  drawLive();
+}
+function drawLive(){
+  if(phase === 'A'){
+    liveSvg.innerHTML = `<circle cx="${cur.x}" cy="${cur.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
+  } else if(phase === 'B'){
+    const aScreen = matApply(buildMatrix(), pendingA.x, pendingA.y);
+    liveSvg.innerHTML =
+      `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${cur.x}" y2="${cur.y}"/>
+       <circle cx="${aScreen[0]}" cy="${aScreen[1]}" r="6" fill="#fff"/>`;
+  }
 }
 function onUp(){
-  if(!drag) return;
-  const {start,cur} = drag;
-  drag = null; liveSvg.innerHTML = ''; hideLoupe();
-  if(Math.hypot(cur.x-start.x, cur.y-start.y) < 20) return;
+  if(!phase) return;
+  liveSvg.innerHTML = ''; hideLoupe();
 
-  const a = toImageSpace(start), b = toImageSpace(cur);
-  const dir = classify(a.x,a.y,b.x,b.y);
-  // keep at most 2 per direction (FIFO)
-  const same = state.guides.filter(g=>g.dir===dir);
-  if(same.length >= 2){
-    const idx = state.guides.indexOf(same[0]);
-    state.guides.splice(idx,1);
+  if(phase === 'A'){
+    pendingA = toImageSpace(cur);
+    phase = null;
+    statusEl.textContent = 'Punto iniziale fissato — tocca per posizionare il punto finale.';
+  } else if(phase === 'B'){
+    const b = toImageSpace(cur);
+    const a = pendingA;
+    pendingA = null; phase = null;
+    if(Math.hypot(b.x-a.x, b.y-a.y) < 5){
+      statusEl.textContent = 'Guida troppo corta, riprova.';
+    } else {
+      const dir = classify(a.x,a.y,b.x,b.y);
+      const same = state.guides.filter(g=>g.dir===dir);
+      if(same.length >= 2){
+        const idx = state.guides.indexOf(same[0]);
+        state.guides.splice(idx,1);
+      }
+      state.guides.push({x1:a.x,y1:a.y,x2:b.x,y2:b.y,dir});
+      render();
+      const nv = state.guides.filter(g=>g.dir==='v').length;
+      const nh = state.guides.filter(g=>g.dir==='h').length;
+      statusEl.textContent = (nv>=2||nh>=2)
+        ? 'Correzione attiva.'
+        : 'Serve una seconda guida nella stessa direzione per calcolare il punto di fuga.';
+    }
   }
-  state.guides.push({x1:a.x,y1:a.y,x2:b.x,y2:b.y,dir});
-  render();
-  const nv = state.guides.filter(g=>g.dir==='v').length;
-  const nh = state.guides.filter(g=>g.dir==='h').length;
-  statusEl.textContent = (nv>=2||nh>=2)
-    ? 'Correzione attiva.'
-    : 'Serve una seconda guida nella stessa direzione per calcolare il punto di fuga.';
 }
 viewport.addEventListener('mousedown', onDown);
 window.addEventListener('mousemove', onMove);
@@ -426,7 +452,10 @@ window.addEventListener('touchmove', onMove, {passive:false});
 window.addEventListener('touchend', onUp);
 
 undoBtn.addEventListener('click', ()=>{ state.guides.pop(); render(); });
-clearBtn.addEventListener('click', ()=>{ state.guides.length=0; render(); statusEl.textContent=''; });
+clearBtn.addEventListener('click', ()=>{
+  state.guides.length=0; pendingA=null; phase=null; liveSvg.innerHTML=''; hideLoupe();
+  render(); statusEl.textContent='';
+});
 
 /* ============================ sliders / toggles ============================ */
 rotSlider.addEventListener('input',()=>{ state.rot=+rotSlider.value; rotVal.textContent=state.rot.toFixed(1)+'°'; render(); });
@@ -467,7 +496,7 @@ fileInput.addEventListener('change', async e=>{
     const bmp = await createImageBitmap(f,{imageOrientation:'from-image'});
     state.bitmap = bmp; state.fullW=bmp.width; state.fullH=bmp.height;
     state.fileName=(f.name||'image').replace(/\.[^.]+$/,'');
-    state.guides.length=0;
+    state.guides.length=0; pendingA=null; phase=null; liveSvg.innerHTML=''; hideLoupe();
 
     const s = Math.min(1, PREVIEW_CAP/Math.max(bmp.width,bmp.height));
     const pw=Math.max(1,Math.round(bmp.width*s)), ph=Math.max(1,Math.round(bmp.height*s));
