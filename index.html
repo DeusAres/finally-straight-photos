@@ -5,66 +5,120 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Perspective</title>
 <style>
-  :root{ --bg:#111; --panel:#1b1b1b; --line:#333; --fg:#eee; --dim:#888; --accent:#3b82f6;
-         --vert:#4ade80; --horiz:#fbbf24; }
+  :root{
+    --bg:#08080a; --bg2:#0f0f12; --panel:rgba(20,20,24,.88); --line:rgba(255,255,255,.09);
+    --line-strong:rgba(255,255,255,.16); --fg:#f3f3f5; --dim:#8b8b93; --dim2:#5c5c63;
+    --accent:#5b8cff; --accent2:#7aa2ff; --vert:#34d399; --horiz:#fbbf24;
+    --r-sm:8px; --r-md:12px; --r-lg:16px;
+    --shadow:0 8px 24px rgba(0,0,0,.35);
+  }
   *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
   html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);
-    font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;overscroll-behavior:none;}
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;
+    overscroll-behavior:none;-webkit-font-smoothing:antialiased;}
   body{display:flex;flex-direction:column;height:100vh;height:100dvh;}
 
-  header{padding:9px 14px;display:flex;align-items:center;justify-content:space-between;
-    border-bottom:1px solid var(--line);flex:0 0 auto;}
-  header h1{font-size:15px;font-weight:600;margin:0;}
-  #guideCount{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums;}
+  header{padding:12px 16px;display:flex;align-items:baseline;justify-content:space-between;
+    border-bottom:1px solid var(--line);flex:0 0 auto;
+    background:linear-gradient(180deg,var(--bg2),var(--bg));}
+  header .titleGroup{display:flex;align-items:baseline;gap:8px;}
+  header h1{font-size:16px;font-weight:650;margin:0;letter-spacing:-.01em;}
+  header .version{font-size:10px;font-weight:600;color:var(--dim2);
+    background:rgba(255,255,255,.06);padding:2px 6px;border-radius:5px;
+    letter-spacing:.02em;}
+  #guideCount{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums;font-weight:500;}
 
   #stage{flex:1 1 auto;position:relative;overflow:hidden;display:flex;
     align-items:center;justify-content:center;touch-action:none;
-    background:repeating-conic-gradient(#1a1a1a 0% 25%,#151515 0% 50%) 50%/20px 20px;}
-  #viewport{position:relative;overflow:hidden;touch-action:none;background:#fff;}
-  #imgLayer{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform;}
+    background:
+      radial-gradient(ellipse at 50% 30%, rgba(91,140,255,.05), transparent 60%),
+      repeating-conic-gradient(#131315 0% 25%,#0d0d0f 0% 50%) 50%/22px 22px;}
+
+  /* isolate creates a clean stacking context boundary so the projective
+     matrix3d layer below can't disturb sibling paint order (WebKit stacking quirk) */
+  #viewport{position:relative;overflow:hidden;touch-action:none;background:#fff;
+    isolation:isolate;border-radius:2px;box-shadow:var(--shadow);}
+  #imgLayer{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform;z-index:1;}
   #imgLayer img{display:block;user-select:none;-webkit-user-drag:none;position:absolute;top:0;left:0;}
   #guideSvg{position:absolute;top:0;left:0;overflow:visible;}
-  #guideSvg line{stroke-width:2;vector-effect:non-scaling-stroke;}
+  #guideSvg line{stroke-width:2.5;vector-effect:non-scaling-stroke;
+    filter:drop-shadow(0 1px 2px rgba(0,0,0,.6));}
   #guideSvg line.v{stroke:var(--vert);}
   #guideSvg line.h{stroke:var(--horiz);}
-  #guideSvg circle{r:5;vector-effect:non-scaling-stroke;stroke:#000;stroke-width:1;}
+  #guideSvg circle{r:5.5;vector-effect:non-scaling-stroke;stroke:rgba(0,0,0,.5);stroke-width:1.5;}
   #guideSvg circle.v{fill:var(--vert);}
   #guideSvg circle.h{fill:var(--horiz);}
 
-  #gridSvg{position:absolute;inset:0;pointer-events:none;}
-  #gridSvg line{stroke:rgba(255,255,255,.5);stroke-width:1;vector-effect:non-scaling-stroke;}
+  #gridSvg{position:absolute;inset:0;pointer-events:none;z-index:2;isolation:isolate;}
+  #gridSvg line{stroke:rgba(255,255,255,.45);stroke-width:1;vector-effect:non-scaling-stroke;}
   #gridSvg line.strong{stroke:rgba(255,255,255,.8);}
-  #liveSvg{position:absolute;inset:0;pointer-events:none;}
-  #liveSvg line{stroke:#fff;stroke-width:2;stroke-dasharray:5 4;vector-effect:non-scaling-stroke;}
+  #liveSvg{position:absolute;inset:0;pointer-events:none;z-index:5;isolation:isolate;}
+  #liveSvg line{stroke:#fff;stroke-width:2.5;stroke-dasharray:6 5;vector-effect:non-scaling-stroke;
+    filter:drop-shadow(0 1px 3px rgba(0,0,0,.7));}
 
-  #placeholder{color:var(--dim);font-size:14px;text-align:center;padding:24px;pointer-events:none;line-height:1.6;}
+  /* magnifier loupe, shown while dragging a guide */
+  #loupe{position:absolute;width:132px;height:132px;border-radius:50%;
+    border:2.5px solid rgba(255,255,255,.92);box-shadow:0 6px 20px rgba(0,0,0,.5),0 0 0 1px rgba(0,0,0,.3);
+    overflow:hidden;pointer-events:none;z-index:10;display:none;
+    transform:translate(-50%,-100%);isolation:isolate;background:#000;}
+  #loupe canvas{width:100%;height:100%;display:block;}
+  #loupe .cross{position:absolute;top:50%;left:50%;width:22px;height:22px;
+    transform:translate(-50%,-50%);pointer-events:none;}
+  #loupe .cross::before,#loupe .cross::after{content:'';position:absolute;background:rgba(255,60,60,.9);}
+  #loupe .cross::before{left:50%;top:0;width:1.5px;height:100%;transform:translateX(-50%);}
+  #loupe .cross::after{top:50%;left:0;height:1.5px;width:100%;transform:translateY(-50%);}
 
-  #tray{flex:0 0 auto;background:var(--panel);border-top:1px solid var(--line);
-    padding:10px 14px calc(12px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:9px;}
-  .row{display:flex;align-items:center;gap:10px;}
-  .row label{font-size:12px;color:var(--dim);width:52px;flex:0 0 auto;}
-  .row input[type=range]{flex:1 1 auto;accent-color:var(--accent);}
-  .row .val{font-size:12px;color:var(--dim);width:46px;text-align:right;font-variant-numeric:tabular-nums;}
-  .toolbar{display:flex;gap:7px;flex-wrap:wrap;}
-  button,.fileBtn{background:#262626;color:var(--fg);border:1px solid var(--line);border-radius:8px;
-    padding:9px 11px;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;}
-  button:active{background:#333;}
-  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;}
-  button.toggled{background:#3b3b3b;border-color:#555;}
-  button:disabled{opacity:.4;pointer-events:none;}
+  #placeholder{color:var(--dim);font-size:14px;text-align:center;padding:24px;pointer-events:none;line-height:1.65;}
+  #placeholder b{color:var(--fg);font-weight:600;}
+
+  #tray{flex:0 0 auto;background:var(--panel);backdrop-filter:blur(20px) saturate(1.4);
+    -webkit-backdrop-filter:blur(20px) saturate(1.4);
+    border-top:1px solid var(--line);border-radius:var(--r-lg) var(--r-lg) 0 0;
+    margin-top:-14px;position:relative;z-index:1;
+    padding:14px 14px calc(12px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:11px;}
+  .row{display:flex;align-items:center;gap:11px;}
+  .row label{font-size:12px;color:var(--dim);width:56px;flex:0 0 auto;font-weight:500;}
+  .row .val{font-size:12px;color:var(--fg);width:48px;text-align:right;font-variant-numeric:tabular-nums;font-weight:600;}
+
+  input[type=range]{flex:1 1 auto;-webkit-appearance:none;appearance:none;background:transparent;height:24px;}
+  input[type=range]::-webkit-slider-runnable-track{
+    height:4px;border-radius:2px;background:linear-gradient(90deg,var(--line-strong),var(--line-strong));}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;
+    width:20px;height:20px;border-radius:50%;background:#fff;margin-top:-8px;
+    box-shadow:0 2px 6px rgba(0,0,0,.4),0 0 0 1px rgba(0,0,0,.08);
+    border:5px solid var(--accent);}
+  input[type=range]::-moz-range-track{height:4px;border-radius:2px;background:var(--line-strong);}
+  input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#fff;
+    border:5px solid var(--accent);box-shadow:0 2px 6px rgba(0,0,0,.4);}
+
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;}
+  button,.fileBtn{background:rgba(255,255,255,.06);color:var(--fg);border:1px solid var(--line);
+    border-radius:var(--r-sm);padding:9px 12px;font-size:13px;font-weight:500;cursor:pointer;
+    display:inline-flex;align-items:center;gap:6px;transition:background .12s,transform .08s;}
+  button:active{background:rgba(255,255,255,.12);transform:scale(.97);}
+  button.primary{background:linear-gradient(180deg,var(--accent2),var(--accent));
+    border-color:transparent;color:#fff;font-weight:650;
+    box-shadow:0 4px 14px rgba(91,140,255,.35);}
+  button.primary:active{transform:scale(.97);}
+  button.toggled{background:rgba(255,255,255,.14);border-color:var(--line-strong);}
+  button:disabled{opacity:.35;pointer-events:none;}
   input[type=file]{display:none;}
-  .segmented{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;}
-  .segmented button{border:none;border-radius:0;background:#222;padding:9px 10px;}
-  .segmented button.active{background:var(--accent);color:#fff;}
-  #status{font-size:12px;color:var(--dim);min-height:15px;}
-  .hint{font-size:11px;color:#666;}
+  .segmented{display:flex;border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden;
+    background:rgba(255,255,255,.04);}
+  .segmented button{border:none;border-radius:0;background:transparent;padding:9px 12px;}
+  .segmented button.active{background:var(--accent);color:#fff;font-weight:650;}
+  #status{font-size:12px;color:var(--dim);min-height:15px;font-weight:500;}
+  .hint{font-size:11px;color:var(--dim2);line-height:1.5;}
   a#dl{display:none;}
 </style>
 </head>
 <body>
 
 <header>
-  <h1>Perspective</h1>
+  <div class="titleGroup">
+    <h1>Perspective</h1>
+    <span class="version" id="versionBadge"></span>
+  </div>
   <div id="guideCount">0 guide</div>
 </header>
 
@@ -79,6 +133,7 @@
     </div>
     <svg id="gridSvg"></svg>
     <svg id="liveSvg"></svg>
+    <div id="loupe"><canvas id="loupeCanvas" width="132" height="132"></canvas><div class="cross"></div></div>
   </div>
 </div>
 
@@ -121,6 +176,9 @@
 (function(){
 'use strict';
 
+const VERSION = 'v0.2.0';
+document.getElementById('versionBadge').textContent = VERSION;
+
 /* ============================ mat3 utilities ============================ */
 // Row-major 3x3, arrays of 9. Points are homogeneous [x,y,1].
 function matMul(A,B){
@@ -159,7 +217,8 @@ const state = {
   viewW: 0, viewH: 0,        // displayed image size
   fullW: 0, fullH: 0,        // source pixel size
   bitmap: null,
-  fileName: 'image'
+  fileName: 'image',
+  previewCanvas: null        // capped-res canvas, source for the loupe magnifier
 };
 
 const stage=document.getElementById('stage'), viewport=document.getElementById('viewport'),
@@ -295,11 +354,39 @@ function toImageSpace(p){
   const [x,y] = matApply(Minv, p.x, p.y);
   return {x,y};
 }
+
+// ---- magnifier loupe: zoomed crop of the untransformed preview, centered on
+// the point currently under the finger, so you can place guides precisely
+// on a small phone screen without a conflicting pinch/pan gesture ----
+const loupeEl = document.getElementById('loupe');
+const loupeCtx = document.getElementById('loupeCanvas').getContext('2d');
+const LOUPE_SRC_RADIUS = 26; // px, in previewCanvas units
+function updateLoupe(screenPt){
+  if(!state.previewCanvas) return;
+  const imgPt = toImageSpace(screenPt);
+  const scale = state.previewCanvas.width / state.viewW;
+  const cx = imgPt.x*scale, cy = imgPt.y*scale;
+  loupeCtx.imageSmoothingEnabled = true;
+  loupeCtx.clearRect(0,0,132,132);
+  loupeCtx.save();
+  loupeCtx.beginPath(); loupeCtx.arc(66,66,66,0,Math.PI*2); loupeCtx.clip();
+  loupeCtx.drawImage(state.previewCanvas,
+    cx-LOUPE_SRC_RADIUS, cy-LOUPE_SRC_RADIUS, LOUPE_SRC_RADIUS*2, LOUPE_SRC_RADIUS*2,
+    0,0,132,132);
+  loupeCtx.restore();
+  // position: centered horizontally on the touch point, floating above the finger
+  loupeEl.style.left = screenPt.x+'px';
+  loupeEl.style.top = (screenPt.y-28)+'px';
+  loupeEl.style.display = 'block';
+}
+function hideLoupe(){ loupeEl.style.display = 'none'; }
+
 function onDown(e){
   if(!state.bitmap) return;
   e.preventDefault();
   const p = viewPoint(e);
   drag = {start:p, cur:p};
+  updateLoupe(p);
 }
 function onMove(e){
   if(!drag) return;
@@ -307,11 +394,12 @@ function onMove(e){
   drag.cur = viewPoint(e);
   liveSvg.innerHTML =
     `<line x1="${drag.start.x}" y1="${drag.start.y}" x2="${drag.cur.x}" y2="${drag.cur.y}"/>`;
+  updateLoupe(drag.cur);
 }
 function onUp(){
   if(!drag) return;
   const {start,cur} = drag;
-  drag = null; liveSvg.innerHTML = '';
+  drag = null; liveSvg.innerHTML = ''; hideLoupe();
   if(Math.hypot(cur.x-start.x, cur.y-start.y) < 20) return;
 
   const a = toImageSpace(start), b = toImageSpace(cur);
@@ -385,6 +473,7 @@ fileInput.addEventListener('change', async e=>{
     const pw=Math.max(1,Math.round(bmp.width*s)), ph=Math.max(1,Math.round(bmp.height*s));
     const c=document.createElement('canvas'); c.width=pw; c.height=ph;
     c.getContext('2d').drawImage(bmp,0,0,pw,ph);
+    state.previewCanvas = c; // reused by the loupe magnifier, no re-decode needed
     const url=c.toDataURL('image/jpeg',0.9);
 
     imgEl.onload=()=>{ placeholder.style.display='none'; layout(); exportBtn.disabled=false;
