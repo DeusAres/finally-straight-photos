@@ -50,6 +50,11 @@
   #guideSvg circle.v{fill:var(--vert);}
   #guideSvg circle.h{fill:var(--horiz);}
 
+  #meshCanvas{position:absolute;top:0;left:0;display:none;z-index:1;}
+  #meshSvg{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:3;display:none;}
+  #meshSvg polyline{fill:none;stroke:rgba(91,140,255,.55);stroke-width:1.5;vector-effect:non-scaling-stroke;}
+  #meshSvg circle{r:10;fill:#5b8cff;stroke:rgba(0,0,0,.55);stroke-width:2;vector-effect:non-scaling-stroke;}
+  #meshSvg circle.active{fill:#fff;r:12;}
   #gridSvg{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2;}
   #gridSvg line{stroke:rgba(255,255,255,.45);stroke-width:1;vector-effect:non-scaling-stroke;}
   #gridSvg line.strong{stroke:rgba(255,255,255,.8);}
@@ -132,6 +137,8 @@
       <img id="img" alt="">
       <svg id="guideSvg"></svg>
     </div>
+    <canvas id="meshCanvas"></canvas>
+    <svg id="meshSvg"></svg>
     <svg id="gridSvg"></svg>
     <svg id="liveSvg"></svg>
     <div id="loupe"><canvas id="loupeCanvas" width="132" height="132"></canvas><div class="cross"></div></div>
@@ -159,11 +166,13 @@
     <div class="segmented" id="modeSeg">
       <button data-mode="guides" class="active">Guide</button>
       <button data-mode="corners">Angoli</button>
+      <button data-mode="mesh">Mesh</button>
     </div>
     <label class="fileBtn" for="fileInput">📷 Apri</label>
     <input type="file" id="fileInput" accept="image/*">
     <button id="undoBtn" disabled>↩︎ Ultima guida</button>
     <button id="clearBtn" disabled>Cancella guide</button>
+    <button id="meshNBtn" style="display:none">Mesh: 4×4</button>
     <button id="gridBtn" class="toggled">Griglia: terzi</button>
     <div class="segmented" id="fillSeg">
       <button data-fill="white" class="active">Bianco</button>
@@ -181,7 +190,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.7.0';
+const VERSION = 'v0.8.0';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -217,7 +226,8 @@ function cross(p,q){
 
 /* ============================ state ============================ */
 const state = {
-  mode: 'guides',    // 'guides' | 'corners'
+  mode: 'guides',    // 'guides' | 'corners' | 'mesh'
+  mesh: null, meshOrig: null, meshN: 4, texDirty: true,
   corners: null,     // [[x,y] x4] in image space, order TL,TR,BR,BL
   guides: [],        // {x1,y1,x2,y2,dir:'v'|'h'}  in VIEW coords (== displayed image px)
   rot: 0, scale: 100, amount: 100,
@@ -410,6 +420,282 @@ function computeCornerH(){
   return solveH4(c,tgt) || IDENT.slice();
 }
 
+
+/* ===================== mesh warp (free-form, multi-plane) =====================
+   Guides and corners both rectify ONE plane, which is why they cannot fix a
+   ceiling and the wall bands under it at the same time: those planes sit at
+   different orientations in 3D. The mesh gives up global projective correctness
+   in exchange for local control — the tool of last resort for architecture.
+
+   Control points are interpolated with bicubic Catmull-Rom, NOT bilinear
+   triangles: a piecewise-linear mesh creases visibly at cell boundaries, which
+   on straight architectural edges is immediately obvious.                     */
+
+const MESH_FINE = 44;          // evaluation grid per side (independent of control density)
+let dragMesh = -1;             // index of the control point being dragged
+let meshUVCache = null, meshIdxCache = null;
+let meshGL = null;             // preview context, created lazily
+
+const meshCanvas = document.getElementById('meshCanvas');
+const meshSvg    = document.getElementById('meshSvg');
+const meshNBtn   = document.getElementById('meshNBtn');
+
+function initMesh(n){
+  const N = n || state.meshN || 4;
+  state.meshN = N;
+  state.mesh = []; state.meshOrig = [];
+  for(let i=0;i<N;i++) for(let j=0;j<N;j++){
+    const x = state.viewW*j/(N-1), y = state.viewH*i/(N-1);
+    state.mesh.push([x,y]); state.meshOrig.push([x,y]);
+  }
+}
+
+function cr(p0,p1,p2,p3,t){
+  const t2=t*t, t3=t2*t;
+  return 0.5*((2*p1) + (-p0+p2)*t + (2*p0-5*p1+4*p2-p3)*t2 + (-p0+3*p1-3*p2+p3)*t3);
+}
+
+// blended control point (Intensità)
+function meshCPraw(i,j){
+  const N=state.meshN, t=state.amount/100;
+  const k=i*N+j, o=state.meshOrig[k], p=state.mesh[k];
+  return [ o[0]+(p[0]-o[0])*t, o[1]+(p[1]-o[1])*t ];
+}
+// Phantom points outside the lattice are LINEARLY EXTRAPOLATED, not clamped.
+// Clamping duplicates the edge point, which gives Catmull-Rom the wrong tangent
+// at the border: the mesh then fails to reproduce even a regular grid, so the
+// image was warped by ~27px at rest with nothing dragged.
+function meshCP(i,j){
+  const N=state.meshN;
+  if(i<0)   { const a=meshCP(0,j),   b=meshCP(1,j);   return [2*a[0]-b[0], 2*a[1]-b[1]]; }
+  if(i>N-1) { const a=meshCP(N-1,j), b=meshCP(N-2,j); return [2*a[0]-b[0], 2*a[1]-b[1]]; }
+  if(j<0)   { const a=meshCP(i,0),   b=meshCP(i,1);   return [2*a[0]-b[0], 2*a[1]-b[1]]; }
+  if(j>N-1) { const a=meshCP(i,N-1), b=meshCP(i,N-2); return [2*a[0]-b[0], 2*a[1]-b[1]]; }
+  return meshCPraw(i,j);
+}
+
+function meshPointAt(u,v){
+  const N=state.meshN;
+  const fx=u*(N-1), fy=v*(N-1);
+  const j0=Math.min(N-2,Math.max(0,Math.floor(fx)));
+  const i0=Math.min(N-2,Math.max(0,Math.floor(fy)));
+  const tu=fx-j0, tv=fy-i0;
+  const rx=[], ry=[];
+  for(let di=-1;di<=2;di++){
+    const a=meshCP(i0+di,j0-1), b=meshCP(i0+di,j0), c=meshCP(i0+di,j0+1), d=meshCP(i0+di,j0+2);
+    rx.push(cr(a[0],b[0],c[0],d[0],tu));
+    ry.push(cr(a[1],b[1],c[1],d[1],tu));
+  }
+  return [ cr(rx[0],rx[1],rx[2],rx[3],tv), cr(ry[0],ry[1],ry[2],ry[3],tv) ];
+}
+
+// rotation + scale about the centre (no homography, no fit, in mesh mode)
+function meshAffine(){
+  const cx=state.viewW/2, cy=state.viewH/2;
+  const th=state.rot*Math.PI/180, c=Math.cos(th), sn=Math.sin(th), k=state.scale/100;
+  return matMul([1,0,cx, 0,1,cy, 0,0,1],
+         matMul([c,-sn,0, sn,c,0, 0,0,1],
+         matMul([k,0,0, 0,k,0, 0,0,1], [1,0,-cx, 0,1,-cy, 0,0,1])));
+}
+
+function meshStatic(){
+  if(meshIdxCache) return {uv:meshUVCache, idx:meshIdxCache};
+  const n=MESH_FINE, uv=new Float32Array(n*n*2), idx=[];
+  for(let i=0;i<n;i++) for(let j=0;j<n;j++){
+    const k=(i*n+j)*2; uv[k]=j/(n-1); uv[k+1]=i/(n-1);
+  }
+  for(let i=0;i<n-1;i++) for(let j=0;j<n-1;j++){
+    const a=i*n+j, b=a+1, c=a+n, d=c+1;
+    idx.push(a,b,c, b,d,c);
+  }
+  meshUVCache=uv; meshIdxCache=new Uint32Array(idx);
+  return {uv:meshUVCache, idx:meshIdxCache};
+}
+
+function meshPositions(k, A){
+  const n=MESH_FINE, pos=new Float32Array(n*n*2);
+  for(let i=0;i<n;i++) for(let j=0;j<n;j++){
+    let p = meshPointAt(j/(n-1), i/(n-1));
+    if(A) p = matApply(A, p[0], p[1]);
+    const o=(i*n+j)*2; pos[o]=p[0]*k; pos[o+1]=p[1]*k;
+  }
+  return pos;
+}
+
+const MESH_VS = `#version 300 es
+in vec2 aPos; in vec2 aUV;
+uniform vec2 uOut; uniform float uBandY;
+out vec2 vUV;
+void main(){
+  float x = aPos.x/uOut.x*2.0 - 1.0;
+  float y = 1.0 - (aPos.y-uBandY)/uOut.y*2.0;   // dest y grows downward
+  gl_Position = vec4(x,y,0.0,1.0);
+  vUV = aUV;
+}`;
+const MESH_FS = `#version 300 es
+precision highp float;
+in vec2 vUV; uniform sampler2D uTex; out vec4 outColor;
+void main(){ outColor = vec4(texture(uTex, vUV).rgb, 1.0); }`;
+
+function buildMeshProgram(gl){
+  const prog=gl.createProgram();
+  gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, MESH_VS));
+  gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, MESH_FS));
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error('mesh link: '+gl.getProgramInfoLog(prog));
+  return prog;
+}
+
+function meshGLSetup(gl, prog, source){
+  gl.useProgram(prog);
+  const {uv, idx} = meshStatic();
+  const vbo=gl.createBuffer(), uvbo=gl.createBuffer(), ibo=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, uvbo);
+  gl.bufferData(gl.ARRAY_BUFFER, uv, gl.STATIC_DRAW);
+  const lu=gl.getAttribLocation(prog,'aUV');
+  gl.enableVertexAttribArray(lu); gl.vertexAttribPointer(lu,2,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  const tex=gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE, source);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.uniform1i(gl.getUniformLocation(prog,'uTex'),0);
+  return {vbo, ibo, tex, idxCount: idx.length,
+          uOut: gl.getUniformLocation(prog,'uOut'),
+          uBandY: gl.getUniformLocation(prog,'uBandY'),
+          aPos: gl.getAttribLocation(prog,'aPos')};
+}
+
+function getMeshGL(){
+  if(meshGL && !meshGL.gl.isContextLost()) return meshGL;
+  const gl = meshCanvas.getContext('webgl2',{antialias:true, preserveDrawingBuffer:true});
+  if(!gl) return null;
+  try{
+    const prog = buildMeshProgram(gl);
+    meshGL = Object.assign({gl, prog}, meshGLSetup(gl, prog, state.previewCanvas));
+    return meshGL;
+  }catch(err){ console.warn('mesh GL init failed:', err); return null; }
+}
+// iOS drops GL contexts aggressively; rebuild on the next frame instead of dying
+meshCanvas.addEventListener('webglcontextlost', e=>{ e.preventDefault(); meshGL=null; }, false);
+meshCanvas.addEventListener('webglcontextrestored', ()=>{ meshGL=null; render(); }, false);
+
+function renderMeshPreview(){
+  if(!state.previewCanvas || !state.mesh) return;
+  const dpr = Math.min(window.devicePixelRatio||1, 2);
+  const W = Math.max(1,Math.round(state.viewW*dpr)), H = Math.max(1,Math.round(state.viewH*dpr));
+  meshCanvas.style.width = state.viewW+'px';
+  meshCanvas.style.height = state.viewH+'px';
+  if(meshCanvas.width!==W || meshCanvas.height!==H){ meshCanvas.width=W; meshCanvas.height=H; meshGL=null; }
+  const g = getMeshGL(); if(!g) return;
+  const gl = g.gl;
+  if(state.texDirty){
+    gl.bindTexture(gl.TEXTURE_2D, g.tex);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE, state.previewCanvas);
+    state.texDirty=false;
+  }
+  gl.useProgram(g.prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, g.vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, meshPositions(dpr, meshAffine()), gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(g.aPos);
+  gl.vertexAttribPointer(g.aPos,2,gl.FLOAT,false,0,0);
+  gl.viewport(0,0,W,H);
+  gl.uniform2f(g.uOut, W, H);
+  gl.uniform1f(g.uBandY, 0);
+  const f = state.fill==='white' ? 1 : 0;
+  gl.clearColor(f,f,f,1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, g.tex);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, g.ibo);
+  gl.drawElements(gl.TRIANGLES, g.idxCount, gl.UNSIGNED_INT, 0);
+}
+
+function drawMeshHandles(){
+  if(!state.mesh){ meshSvg.innerHTML=''; return; }
+  const A = meshAffine(), N = state.meshN;
+  const P = (i,j)=>{ const p = meshCP(i,j); const q = matApply(A,p[0],p[1]); return q[0].toFixed(1)+','+q[1].toFixed(1); };
+  let s='';
+  for(let i=0;i<N;i++){ const pts=[]; for(let j=0;j<N;j++) pts.push(P(i,j)); s+=`<polyline points="${pts.join(' ')}"/>`; }
+  for(let j=0;j<N;j++){ const pts=[]; for(let i=0;i<N;i++) pts.push(P(i,j)); s+=`<polyline points="${pts.join(' ')}"/>`; }
+  for(let i=0;i<N;i++) for(let j=0;j<N;j++){
+    const p=meshCP(i,j), q=matApply(A,p[0],p[1]);
+    s+=`<circle class="${i*N+j===dragMesh?'active':''}" cx="${q[0].toFixed(1)}" cy="${q[1].toFixed(1)}"/>`;
+  }
+  meshSvg.innerHTML=s;
+  guideCount.textContent = N+'×'+N;
+  undoBtn.disabled = true; clearBtn.disabled = false;
+}
+
+// loupe in mesh mode: crop straight out of the rendered WebGL canvas, so what the
+// crosshair shows is by construction exactly what is on screen
+function updateLoupeFromCanvas(target, anchor){
+  if(!meshCanvas.width) return;
+  const dpr = meshCanvas.width/state.viewW;
+  const r = 22*dpr;
+  loupeCtx.setTransform(1,0,0,1,0,0);
+  loupeCtx.clearRect(0,0,132,132);
+  loupeCtx.fillStyle='#000'; loupeCtx.fillRect(0,0,132,132);
+  loupeCtx.save();
+  loupeCtx.beginPath(); loupeCtx.arc(66,66,66,0,Math.PI*2); loupeCtx.clip();
+  loupeCtx.drawImage(meshCanvas, target.x*dpr-r, target.y*dpr-r, 2*r, 2*r, 0,0,132,132);
+  loupeCtx.restore();
+  const above = anchor.y-28 > 150;
+  loupeEl.style.left = anchor.x+'px';
+  loupeEl.style.top  = (above? anchor.y-28 : anchor.y+28)+'px';
+  loupeEl.style.transform = above? 'translate(-50%,-100%)' : 'translate(-50%,0)';
+  loupeEl.style.display='block';
+}
+
+// full-resolution mesh bake, banded like the homography path
+async function warpMeshFullRes(){
+  const w=state.fullW, h=state.fullH, BAND=256;
+  const canvas=document.createElement('canvas');
+  canvas.width=w; canvas.height=Math.min(BAND,h);
+  const gl=canvas.getContext('webgl2',{antialias:false});
+  if(!gl) throw new Error('WebGL2 non disponibile');
+  const maxTex=gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  if(Math.max(w,h)>maxTex) throw new Error(`immagine oltre MAX_TEXTURE_SIZE (${maxTex})`);
+
+  const prog=buildMeshProgram(gl);
+  const g=meshGLSetup(gl, prog, state.bitmap);
+  const k=w/state.viewW;
+  gl.bindBuffer(gl.ARRAY_BUFFER, g.vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, meshPositions(k, meshAffine()), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(g.aPos);
+  gl.vertexAttribPointer(g.aPos,2,gl.FLOAT,false,0,0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, g.tex);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, g.ibo);
+  const f = state.fill==='white'?1:0;
+
+  const rgb=new Uint8Array(w*h*3);
+  const px=new Uint8Array(w*BAND*4);
+  for(let y0=0;y0<h;y0+=BAND){
+    const bh=Math.min(BAND,h-y0);
+    if(canvas.height!==bh) canvas.height=bh;
+    gl.viewport(0,0,w,bh);
+    gl.uniform2f(g.uOut, w, bh);
+    gl.uniform1f(g.uBandY, y0);
+    gl.clearColor(f,f,f,1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawElements(gl.TRIANGLES, g.idxCount, gl.UNSIGNED_INT, 0);
+    gl.readPixels(0,0,w,bh,gl.RGBA,gl.UNSIGNED_BYTE,px);
+    // vertex shader flips y for screen orientation, so readPixels rows come back
+    // bottom-up relative to the band: row r is output row y0 + (bh-1-r)
+    for(let r=0;r<bh;r++){
+      let si=r*w*4, di=(y0+(bh-1-r))*w*3;
+      for(let x=0;x<w;x++){ rgb[di]=px[si]; rgb[di+1]=px[si+1]; rgb[di+2]=px[si+2]; si+=4; di+=3; }
+    }
+    statusEl.textContent=`Warp mesh ${Math.round((y0+bh)/h*100)}%…`;
+    await new Promise(r=>setTimeout(r,0));
+  }
+  gl.deleteTexture(g.tex); gl.deleteBuffer(g.vbo); gl.deleteBuffer(g.ibo); gl.deleteProgram(prog);
+  const lose=gl.getExtension('WEBGL_lose_context'); if(lose) lose.loseContext();
+  return rgb;
+}
+
 // full transform: Fit * Scale * Rot * H   (all in view coords)
 function buildMatrix(){
   const H = state.mode==='corners' ? computeCornerH() : computeHomography();
@@ -440,6 +726,12 @@ function buildMatrix(){
 }
 
 function render(){
+  if(state.mode === 'mesh'){
+    imgLayer.style.display='none'; meshCanvas.style.display='block'; meshSvg.style.display='block';
+    renderMeshPreview(); drawMeshHandles();
+    return;
+  }
+  imgLayer.style.display=''; meshCanvas.style.display='none'; meshSvg.style.display='none';
   const M = buildMatrix();
   // CSS matrix3d is column-major: (m11,m12,m13,m14, m21,...) mapping
   // homography [h0 h1 h2; h3 h4 h5; h6 h7 h8]
@@ -598,6 +890,26 @@ function onDown(e){
   cur = viewPoint(e);
   if(!cur){ activeTouchId=null; return; }
 
+  if(state.mode === 'mesh'){
+    if(!state.mesh){ activeTouchId=null; return; }
+    const A = meshAffine(); const N = state.meshN;
+    let best=-1, bestD=Infinity, bestScr=null;
+    for(let i=0;i<N;i++) for(let j=0;j<N;j++){
+      const p=meshCP(i,j), q=matApply(A,p[0],p[1]);
+      const d=Math.hypot(q[0]-cur.x, q[1]-cur.y);
+      if(d<bestD){ bestD=d; best=i*N+j; bestScr=q; }
+    }
+    if(bestD > 60){
+      statusEl.textContent='Tocca più vicino a un punto della mesh.';
+      activeTouchId=null; return;
+    }
+    dragMesh = best;
+    grabOffset = [ bestScr[0]-cur.x, bestScr[1]-cur.y ];
+    drawMeshHandles();
+    updateLoupeFromCanvas({x:bestScr[0], y:bestScr[1]}, cur);
+    return;
+  }
+
   if(state.mode === 'corners'){
     if(!state.corners){ activeTouchId=null; return; }
     // hit-test in SCREEN space so the tolerance is a real finger radius
@@ -628,11 +940,28 @@ function onDown(e){
 }
 
 function onMove(e){
-  if(dragCorner < 0 && !phase) return;
+  if(dragMesh < 0 && dragCorner < 0 && !phase) return;
   e.preventDefault();
   const np = viewPoint(e);
   if(!np) return;                                // event for a different finger
   cur = np;
+
+  if(dragMesh >= 0){
+    const tx = cur.x + grabOffset[0], ty = cur.y + grabOffset[1];
+    const Ainv = matInv(meshAffine());
+    if(Ainv){
+      const p = matApply(Ainv, tx, ty);
+      const t = state.amount/100;
+      const o = state.meshOrig[dragMesh];
+      // handles are drawn at the BLENDED position, so undo the blend when storing
+      state.mesh[dragMesh] = t > 0.02
+        ? [ o[0]+(p[0]-o[0])/t, o[1]+(p[1]-o[1])/t ]
+        : [ p[0], p[1] ];
+      renderMeshPreview(); drawMeshHandles();
+      updateLoupeFromCanvas({x:tx, y:ty}, cur);
+    }
+    return;
+  }
 
   if(dragCorner >= 0){
     const Minv = matInv(frozenMatrix);
@@ -663,6 +992,12 @@ function drawLive(){
 }
 function onUp(){
   activeTouchId = null;
+  if(dragMesh >= 0){
+    dragMesh = -1; grabOffset = null;
+    hideLoupe(); drawMeshHandles();
+    statusEl.textContent = 'Mesh aggiornata.';
+    return;
+  }
   if(dragCorner >= 0){
     dragCorner = -1; frozenMatrix = null; grabOffset = null;
     hideLoupe(); render();            // now re-warp with the new corner
@@ -712,7 +1047,8 @@ const modeSeg = document.getElementById('modeSeg');
 const hintEl = document.querySelector('.hint');
 const HINTS = {
   guides: "Tocca e trascina per posizionare il punto (usa la loupe), rilascia per confermare — poi ripeti per il punto finale. Verde = verticale, giallo = orizzontale. Fino a 4 per direzione (oltre 2 → stima ai minimi quadrati).",
-  corners: "Trascina i 4 angoli sul piano da raddrizzare (soffitto, quadro, documento). Il quadrilatero viene mappato sul rettangolo che lo contiene."
+  corners: "Trascina i 4 angoli sul piano da raddrizzare (soffitto, quadro, documento). Il quadrilatero viene mappato sul rettangolo che lo contiene.",
+  mesh: "Trascina i punti della griglia per raddrizzare zone diverse in modo indipendente. Deformazione locale: utile quando più piani vanno sistemati insieme, ma le rette possono incurvarsi."
 };
 function initCorners(){
   const mx = state.viewW*0.12, my = state.viewH*0.12;
@@ -728,13 +1064,19 @@ modeSeg.addEventListener('click', e=>{
   hintEl.textContent = HINTS[state.mode];
   pendingA=null; phase=null; dragCorner=-1; liveSvg.innerHTML=''; hideLoupe();
   if(state.mode==='corners' && !state.corners && state.bitmap) initCorners();
+  if(state.mode==='mesh' && !state.mesh && state.bitmap) initMesh();
+  meshNBtn.style.display = state.mode==='mesh' ? '' : 'none';
+  dragMesh=-1;
   render();
-  statusEl.textContent = state.mode==='corners'
-    ? 'Trascina gli angoli sul piano da raddrizzare.'
-    : 'Traccia le guide su elementi verticali od orizzontali.';
+  statusEl.textContent = state.mode==='mesh'
+    ? 'Trascina i punti della griglia.'
+    : state.mode==='corners'
+      ? 'Trascina gli angoli sul piano da raddrizzare.'
+      : 'Traccia le guide su elementi verticali od orizzontali.';
 });
 
 clearBtn.addEventListener('click', ()=>{
+  if(state.mode==='mesh'){ initMesh(state.meshN); dragMesh=-1; render(); statusEl.textContent='Mesh reimpostata.'; return; }
   if(state.mode==='corners'){ initCorners(); render(); statusEl.textContent='Angoli reimpostati.'; return; }
   state.guides.length=0; pendingA=null; phase=null; liveSvg.innerHTML=''; hideLoupe();
   render(); statusEl.textContent='';
@@ -781,6 +1123,7 @@ fileInput.addEventListener('change', async e=>{
     state.bitmap = bmp; state.fullW=bmp.width; state.fullH=bmp.height;
     state.fileName=(f.name||'image').replace(/\.[^.]+$/,'');
     state.guides.length=0; pendingA=null; phase=null; dragCorner=-1; state.corners=null;
+    state.mesh=null; state.meshOrig=null; dragMesh=-1; state.texDirty=true; meshGL=null;
     liveSvg.innerHTML=''; hideLoupe();
 
     const s = Math.min(1, PREVIEW_CAP/Math.max(bmp.width,bmp.height));
@@ -812,6 +1155,10 @@ function layout(){
     const kx=newW/state.viewW, ky=newH/state.viewH;
     state.guides.forEach(g=>{ g.x1*=kx; g.y1*=ky; g.x2*=kx; g.y2*=ky; });
     if(state.corners) state.corners = state.corners.map(p=>[p[0]*kx, p[1]*ky]);
+    if(state.mesh){
+      state.mesh     = state.mesh.map(p=>[p[0]*kx, p[1]*ky]);
+      state.meshOrig = state.meshOrig.map(p=>[p[0]*kx, p[1]*ky]);
+    }
   }
 
   state.viewW=newW; state.viewH=newH;
@@ -819,6 +1166,7 @@ function layout(){
   imgEl.style.width=state.viewW+'px'; imgEl.style.height=state.viewH+'px';
   guideSvg.setAttribute('width',state.viewW); guideSvg.setAttribute('height',state.viewH);
   if(state.mode==='corners' && !state.corners) initCorners();
+  if(state.mode==='mesh' && !state.mesh) initMesh();
   drawGrid(); render();
 }
 window.addEventListener('resize', layout);
@@ -989,6 +1337,9 @@ async function doExport(){
 
   statusEl.textContent='Warp a piena risoluzione…';
   let rgb;
+  if(state.mode==='mesh'){
+    rgb = await warpMeshFullRes();
+  } else
   try{ rgb = await warpFullResGL(Hfull); }
   catch(glErr){
     console.warn('WebGL warp fallito, fallback CPU:',glErr);
