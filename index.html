@@ -189,7 +189,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.9.0';
+const VERSION = 'v0.9.1';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -684,14 +684,9 @@ function buildMeshProgram(gl){
 
 function meshGLSetup(gl, prog, source){
   gl.useProgram(prog);
-  const {uv, idx} = meshStatic();
+  // uv/index buffers are filled later by uploadLmStatic, whose grid size depends
+  // on the image aspect ratio and is therefore not known here
   const vbo=gl.createBuffer(), uvbo=gl.createBuffer(), ibo=gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, uvbo);
-  gl.bufferData(gl.ARRAY_BUFFER, uv, gl.STATIC_DRAW);
-  const lu=gl.getAttribLocation(prog,'aUV');
-  gl.enableVertexAttribArray(lu); gl.vertexAttribPointer(lu,2,gl.FLOAT,false,0,0);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
   const tex=gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
@@ -701,7 +696,7 @@ function meshGLSetup(gl, prog, source){
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
   gl.uniform1i(gl.getUniformLocation(prog,'uTex'),0);
-  return {vbo, ibo, tex, idxCount: idx.length,
+  return {vbo, uvbo, ibo, tex, lmIdxCount:0, lmCount:-1,
           uOut: gl.getUniformLocation(prog,'uOut'),
           uBandY: gl.getUniformLocation(prog,'uBandY'),
           aPos: gl.getAttribLocation(prog,'aPos')};
@@ -724,7 +719,7 @@ meshCanvas.addEventListener('webglcontextrestored', ()=>{ meshGL=null; render();
 function lmBufCount(){ const S=lmEnsure(); return S.COLS*10000+S.ROWS; }
 function uploadLmStatic(gl,g){
   const b=lmBuffers();
-  gl.bindBuffer(gl.ARRAY_BUFFER, g.uvbo || (g.uvbo=gl.createBuffer()));
+  gl.bindBuffer(gl.ARRAY_BUFFER, g.uvbo);
   gl.bufferData(gl.ARRAY_BUFFER, b.uv, gl.STATIC_DRAW);
   const lu=gl.getAttribLocation(g.prog,'aUV');
   gl.enableVertexAttribArray(lu); gl.vertexAttribPointer(lu,2,gl.FLOAT,false,0,0);
@@ -877,6 +872,164 @@ function buildMatrix(){
 }
 
 function render(){
+  if(state.mode === 'mesh'){
+    imgLayer.style.display='none'; meshCanvas.style.display='block'; meshSvg.style.display='block';
+    renderMeshPreview(); drawMeshHandles();
+    return;
+  }
+  imgLayer.style.display=''; meshCanvas.style.display='none'; meshSvg.style.display='none';
+  const M = buildMatrix();
+  // CSS matrix3d is column-major
+  imgLayer.style.transform =
+    `matrix3d(${M[0]},${M[3]},0,${M[6]}, ${M[1]},${M[4]},0,${M[7]}, 0,0,1,0, ${M[2]},${M[5]},0,${M[8]})`;
+  drawGuides();
+}
+
+/* ============================ guides / corners overlay ============================ */
+function classify(x1,y1,x2,y2){
+  const ang = Math.abs(Math.atan2(y2-y1, x2-x1) * 180/Math.PI);
+  const fromHoriz = Math.min(ang, 180-ang);
+  return fromHoriz > 45 ? 'v' : 'h';
+}
+
+function drawGuides(){
+  let s = '';
+  if(state.mode === 'corners'){
+    if(state.corners){
+      const c = state.corners;
+      s += `<polygon points="${c.map(p=>p[0]+','+p[1]).join(' ')}" `
+         + `fill="rgba(91,140,255,.10)" stroke="#5b8cff" stroke-width="2" `
+         + `stroke-dasharray="7 5" vector-effect="non-scaling-stroke"/>`;
+      c.forEach((p,i)=>{
+        s += `<circle class="handle" cx="${p[0]}" cy="${p[1]}" `
+           + `fill="${i===dragCorner?'#fff':'#5b8cff'}" stroke="rgba(0,0,0,.55)"/>`;
+      });
+    }
+    guideSvg.innerHTML = s;
+    guideCount.textContent = '4 angoli';
+    undoBtn.disabled = true;
+    clearBtn.disabled = !state.corners;
+    return;
+  }
+  for(const g of state.guides){
+    s += `<line class="${g.dir}" x1="${g.x1}" y1="${g.y1}" x2="${g.x2}" y2="${g.y2}"/>`
+       + `<circle class="${g.dir}" cx="${g.x1}" cy="${g.y1}"/>`
+       + `<circle class="${g.dir}" cx="${g.x2}" cy="${g.y2}"/>`;
+  }
+  guideSvg.innerHTML = s;
+  const nv = state.guides.filter(g=>g.dir==='v').length;
+  const nh = state.guides.filter(g=>g.dir==='h').length;
+  guideCount.textContent = `${nv}V \u00b7 ${nh}H`;
+  undoBtn.disabled = clearBtn.disabled = state.guides.length===0;
+}
+
+/* ============================ pointer plumbing ============================ */
+let pendingA = null;      // first endpoint, confirmed, in image space
+let phase = null;         // null | 'A' | 'B'
+let cur = null;           // live screen point during the current gesture
+let dragCorner = -1;      // index of the corner being dragged, -1 = none
+let frozenMatrix = null;  // transform snapshot held during a corner drag
+let grabOffset = null;    // SCREEN-space delta finger->handle. Must be screen, not
+                          // image: a constant image-space offset maps to a varying
+                          // screen offset under a projective transform, so the handle
+                          // would slowly drift away from the finger as you drag.
+let activeTouchId = null;
+
+function viewPoint(e){
+  let t = e;
+  if(e.touches){
+    t = null;
+    const list = e.changedTouches && e.changedTouches.length ? e.changedTouches : e.touches;
+    if(activeTouchId !== null){
+      for(let i=0;i<list.length;i++) if(list[i].identifier===activeTouchId){ t=list[i]; break; }
+      if(!t) for(let i=0;i<e.touches.length;i++) if(e.touches[i].identifier===activeTouchId){ t=e.touches[i]; break; }
+    }
+    if(!t) t = e.touches[0] || list[0];
+    if(!t) return null;
+  }
+  const r = viewport.getBoundingClientRect();
+  return {x:t.clientX-r.left, y:t.clientY-r.top};
+}
+
+// map a viewport point back into untransformed image space
+function toImageSpace(p){
+  const Minv = matInv(buildMatrix());
+  if(!Minv) return p;
+  const [x,y] = matApply(Minv, p.x, p.y);
+  return {x,y};
+}
+
+const loupeEl = document.getElementById('loupe');
+const loupeCtx = document.getElementById('loupeCanvas').getContext('2d');
+const LOUPE_ZOOM = 3;
+
+// `target` is the point shown under the crosshair — during a corner drag that is
+// the HANDLE, not the finger. `anchor` is where the bubble floats.
+function updateLoupe(target, M, anchor){
+  if(!state.previewCanvas) return;
+  M = M || buildMatrix();
+  anchor = anchor || target;
+  const Minv = matInv(M);
+  if(!Minv) return;
+  const s = state.previewCanvas.width / state.viewW;
+  const p0 = matApply(Minv, target.x, target.y);
+  const px = matApply(Minv, target.x+1, target.y);
+  const py = matApply(Minv, target.x, target.y+1);
+  const a=px[0]-p0[0], b=py[0]-p0[0], c=px[1]-p0[1], d=py[1]-p0[1];
+  const det = a*d - b*c;
+  if(!isFinite(det) || Math.abs(det) < 1e-12) return;
+  const j11= d/det, j12=-b/det, j21=-c/det, j22= a/det;
+  const k = LOUPE_ZOOM / s;
+  const K11=k*j11, K12=k*j12, K21=k*j21, K22=k*j22;
+  const sx = s*p0[0], sy = s*p0[1];
+  const tx = 66 - (K11*sx + K12*sy);
+  const ty = 66 - (K21*sx + K22*sy);
+  loupeCtx.setTransform(1,0,0,1,0,0);
+  loupeCtx.clearRect(0,0,132,132);
+  loupeCtx.fillStyle = '#000'; loupeCtx.fillRect(0,0,132,132);
+  loupeCtx.imageSmoothingEnabled = true;
+  loupeCtx.save();
+  loupeCtx.beginPath(); loupeCtx.arc(66,66,66,0,Math.PI*2); loupeCtx.clip();
+  loupeCtx.setTransform(K11,K21,K12,K22,tx,ty);
+  loupeCtx.drawImage(state.previewCanvas,0,0);
+  loupeCtx.restore();
+  loupeCtx.setTransform(1,0,0,1,0,0);
+  const above = anchor.y - 28 > 150;
+  loupeEl.style.left = anchor.x+'px';
+  loupeEl.style.top  = (above ? anchor.y-28 : anchor.y+28)+'px';
+  loupeEl.style.transform = above ? 'translate(-50%,-100%)' : 'translate(-50%,0)';
+  loupeEl.style.display = 'block';
+}
+function hideLoupe(){ loupeEl.style.display = 'none'; }
+
+function drawLive(){
+  if(phase === 'A'){
+    liveSvg.innerHTML = `<circle cx="${cur.x}" cy="${cur.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
+  } else if(phase === 'B'){
+    const aScreen = state.mode==='mesh'
+      ? (function(){ const A=meshAffine();
+          if(!lmSol) return matApply(A, pendingA.x, pendingA.y);
+          const S=lmEnsure(), w=S.bilin(pendingA.x,pendingA.y);
+          let x=0,y=0; for(const t of w){ x+=t[1]*lmSol.X[t[0]]; y+=t[1]*lmSol.Y[t[0]]; }
+          return matApply(A,x,y); })()
+      : matApply(buildMatrix(), pendingA.x, pendingA.y);
+    liveSvg.innerHTML =
+      `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${cur.x}" y2="${cur.y}"/>
+       <circle cx="${aScreen[0]}" cy="${aScreen[1]}" r="6" fill="#fff"/>`;
+  }
+}
+
+function onDown(e){
+  if(!state.bitmap) return;
+  if(e.touches){
+    if(activeTouchId !== null) return;
+    const t = e.changedTouches && e.changedTouches[0];
+    activeTouchId = t ? t.identifier : null;
+  }
+  e.preventDefault();
+  cur = viewPoint(e);
+  if(!cur){ activeTouchId=null; return; }
+
   if(state.mode === 'mesh'){
     phase = pendingA ? 'B' : 'A';
     updateLoupeFromCanvas(cur, cur);
