@@ -189,7 +189,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.9.1';
+const VERSION = 'v0.9.2';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -758,13 +758,32 @@ function renderMeshPreview(){
   gl.drawElements(gl.TRIANGLES, g.lmIdxCount, gl.UNSIGNED_INT, 0);
 }
 
-function drawMeshHandles(){
+// source point -> screen, THROUGH the solved mesh. The overlay must use this:
+// applying only meshAffine draws the lines where they were traced, so they never
+// appear straightened no matter how well the solver did — a silently lying overlay.
+function lmMap(x,y){
   const A = meshAffine();
+  if(!lmSol) return matApply(A,x,y);
+  const S = lmEnsure(), w = S.bilin(x,y);
+  let X=0,Y=0;
+  for(const t of w){ X+=t[1]*lmSol.X[t[0]]; Y+=t[1]*lmSol.Y[t[0]]; }
+  return matApply(A,X,Y);
+}
+
+function drawMeshHandles(){
   let out='';
   for(const L of (state.mlines||[])){
-    const a=matApply(A,L.x1,L.y1), b=matApply(A,L.x2,L.y2);
     const col = L.dir==='v' ? 'var(--vert)' : 'var(--horiz)';
-    out += `<line x1="${a[0].toFixed(1)}" y1="${a[1].toFixed(1)}" x2="${b[0].toFixed(1)}" y2="${b[1].toFixed(1)}" stroke="${col}" stroke-width="2.5" vector-effect="non-scaling-stroke"/>`
+    // sample along the line: a straight source segment maps to a slightly curved
+    // path, so a polyline shows the ACTUAL result instead of an idealised segment
+    const pts=[];
+    for(let k=0;k<=16;k++){
+      const t=k/16;
+      const q=lmMap(L.x1+(L.x2-L.x1)*t, L.y1+(L.y2-L.y1)*t);
+      pts.push(q[0].toFixed(1)+','+q[1].toFixed(1));
+    }
+    const a=lmMap(L.x1,L.y1), b=lmMap(L.x2,L.y2);
+    out += `<polyline points="${pts.join(' ')}" fill="none" stroke="${col}" stroke-width="2.5" vector-effect="non-scaling-stroke"/>`
          + `<circle cx="${a[0].toFixed(1)}" cy="${a[1].toFixed(1)}" r="5" fill="${col}"/>`
          + `<circle cx="${b[0].toFixed(1)}" cy="${b[1].toFixed(1)}" r="5" fill="${col}"/>`;
   }
@@ -1007,11 +1026,7 @@ function drawLive(){
     liveSvg.innerHTML = `<circle cx="${cur.x}" cy="${cur.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
   } else if(phase === 'B'){
     const aScreen = state.mode==='mesh'
-      ? (function(){ const A=meshAffine();
-          if(!lmSol) return matApply(A, pendingA.x, pendingA.y);
-          const S=lmEnsure(), w=S.bilin(pendingA.x,pendingA.y);
-          let x=0,y=0; for(const t of w){ x+=t[1]*lmSol.X[t[0]]; y+=t[1]*lmSol.Y[t[0]]; }
-          return matApply(A,x,y); })()
+      ? lmMap(pendingA.x, pendingA.y)
       : matApply(buildMatrix(), pendingA.x, pendingA.y);
     liveSvg.innerHTML =
       `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${cur.x}" y2="${cur.y}"/>
@@ -1095,11 +1110,7 @@ function drawLive(){
     liveSvg.innerHTML = `<circle cx="${cur.x}" cy="${cur.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
   } else if(phase === 'B'){
     const aScreen = state.mode==='mesh'
-      ? (function(){ const A=meshAffine();
-          if(!lmSol) return matApply(A, pendingA.x, pendingA.y);
-          const S=lmEnsure(), w=S.bilin(pendingA.x,pendingA.y);
-          let x=0,y=0; for(const t of w){ x+=t[1]*lmSol.X[t[0]]; y+=t[1]*lmSol.Y[t[0]]; }
-          return matApply(A,x,y); })()
+      ? lmMap(pendingA.x, pendingA.y)
       : matApply(buildMatrix(), pendingA.x, pendingA.y);
     liveSvg.innerHTML =
       `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${cur.x}" y2="${cur.y}"/>
