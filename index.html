@@ -49,10 +49,10 @@
   #guideSvg circle.v{fill:var(--vert);}
   #guideSvg circle.h{fill:var(--horiz);}
 
-  #gridSvg{position:absolute;inset:0;pointer-events:none;z-index:2;isolation:isolate;}
+  #gridSvg{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2;}
   #gridSvg line{stroke:rgba(255,255,255,.45);stroke-width:1;vector-effect:non-scaling-stroke;}
   #gridSvg line.strong{stroke:rgba(255,255,255,.8);}
-  #liveSvg{position:absolute;inset:0;pointer-events:none;z-index:5;isolation:isolate;}
+  #liveSvg{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:5;}
   #liveSvg line{stroke:#fff;stroke-width:2.5;stroke-dasharray:6 5;vector-effect:non-scaling-stroke;
     filter:drop-shadow(0 1px 3px rgba(0,0,0,.7));}
 
@@ -166,7 +166,7 @@
     </div>
     <button id="exportBtn" class="primary" disabled>Esporta JPEG</button>
   </div>
-  <div class="hint">Tocca e trascina per posizionare il punto (usa la loupe), rilascia per confermare — poi ripeti per il punto finale. Verde = verticale, giallo = orizzontale. Max 2 per direzione.</div>
+  <div class="hint">Tocca e trascina per posizionare il punto (usa la loupe), rilascia per confermare — poi ripeti per il punto finale. Verde = verticale, giallo = orizzontale. Fino a 4 per direzione (oltre 2 → stima ai minimi quadrati).</div>
   <div id="status"></div>
 </div>
 
@@ -176,7 +176,8 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.3.0';
+const VERSION = 'v0.4.0';
+const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
 /* ============================ mat3 utilities ============================ */
@@ -236,12 +237,58 @@ const stage=document.getElementById('stage'), viewport=document.getElementById('
 const PREVIEW_CAP = 1600;
 
 /* ============================ homography from guides ============================ */
-// Each guide -> line L = p1 x p2. Two same-direction lines -> vanishing point VP = L1 x L2.
-// Both VPs -> horizon l = VPv x VPh; H maps l to infinity => full rectification.
-// One VP only -> minimal-distortion H sending that VP to infinity.
+// STAGE 1 (projective): send the horizon line to infinity -> parallel lines become
+//   parallel again. This alone is only an AFFINE rectification: angles and aspect
+//   are still wrong (residual shear), which is why guides could look satisfied
+//   while the structure still leaned.
+// STAGE 2 (metric): after stage 1 the guide directions are consistent; build the
+//   2x2 map sending the mean horizontal direction to (1,0) and the mean vertical
+//   to (0,1), normalized to unit determinant so area is preserved.
+
+// smallest-eigenvalue eigenvector of a symmetric 3x3, via cyclic Jacobi.
+// Used for least-squares vanishing points when more than 2 guides are given.
+function smallestEigenVec3(M){
+  let a = M.slice();
+  let V = [1,0,0, 0,1,0, 0,0,1];
+  for(let sweep=0; sweep<12; sweep++){
+    const off = a[1]*a[1] + a[2]*a[2] + a[5]*a[5];
+    if(off < 1e-20) break;
+    for(const pq of [[0,1],[0,2],[1,2]]){
+      const p=pq[0], q=pq[1];
+      const apq = a[p*3+q];
+      if(Math.abs(apq) < 1e-18) continue;
+      const app = a[p*3+p], aqq = a[q*3+q];
+      const theta = (aqq-app)/(2*apq);
+      const t = (theta>=0?1:-1)/(Math.abs(theta)+Math.sqrt(theta*theta+1));
+      const c = 1/Math.sqrt(t*t+1), s = t*c;
+      const R = [1,0,0, 0,1,0, 0,0,1];
+      R[p*3+p]=c; R[q*3+q]=c; R[p*3+q]=s; R[q*3+p]=-s;
+      const Rt = [R[0],R[3],R[6], R[1],R[4],R[7], R[2],R[5],R[8]];
+      a = matMul(Rt, matMul(a, R));
+      V = matMul(V, R);
+    }
+  }
+  let best=0, bestVal=Math.abs(a[0]);
+  if(Math.abs(a[4])<bestVal){ best=1; bestVal=Math.abs(a[4]); }
+  if(Math.abs(a[8])<bestVal){ best=2; }
+  return [V[best], V[3+best], V[6+best]];
+}
+
+function vpFromLines(lines){
+  if(lines.length < 2) return null;
+  if(lines.length === 2) return cross(lines[0], lines[1]);
+  // least squares: VP minimizes sum (l_i . p)^2 -> smallest eigenvector of sum l l^T
+  const M = [0,0,0, 0,0,0, 0,0,0];
+  for(const L of lines){
+    const n = Math.hypot(L[0],L[1],L[2]) || 1;
+    const l = [L[0]/n, L[1]/n, L[2]/n];
+    for(let r=0;r<3;r++) for(let c=0;c<3;c++) M[r*3+c] += l[r]*l[c];
+  }
+  return smallestEigenVec3(M);
+}
+
 function computeHomography(){
   const cx = state.viewW/2, cy = state.viewH/2;
-  // work centered for numerical conditioning
   const toC = [1,0,-cx, 0,1,-cy, 0,0,1];
   const fromC = [1,0,cx, 0,1,cy, 0,0,1];
 
@@ -249,38 +296,66 @@ function computeHomography(){
   const vs = state.guides.filter(g=>g.dir==='v');
   const hs = state.guides.filter(g=>g.dir==='h');
 
-  let VPv = null, VPh = null;
-  if(vs.length >= 2) VPv = cross(lineOf(vs[0]), lineOf(vs[1]));
-  if(hs.length >= 2) VPh = cross(lineOf(hs[0]), lineOf(hs[1]));
+  const VPv = vs.length>=2 ? vpFromLines(vs.map(lineOf)) : null;
+  const VPh = hs.length>=2 ? vpFromLines(hs.map(lineOf)) : null;
+  if(!VPv && !VPh) return IDENT.slice();
 
-  let Hc = IDENT.slice();
-
-  if(VPv && VPh){
-    // horizon line through both vanishing points
-    let l = cross(VPv, VPh);
-    const n = Math.hypot(l[0], l[1]);
-    if(n > 1e-12 && Math.abs(l[2]) > 1e-9){
-      // normalize so l[2]=1, then H = [[1,0,0],[0,1,0],[l0,l1,1]]
-      const a = l[0]/l[2], b = l[1]/l[2];
-      if(isFinite(a) && isFinite(b)) Hc = [1,0,0, 0,1,0, a,b,1];
-    }
-  } else if(VPv || VPh){
-    const VP = VPv || VPh;
-    const vx = VP[0], vy = VP[1], vw = VP[2];
-    const d2 = vx*vx + vy*vy;
-    if(d2 > 1e-9 && Math.abs(vw) > 1e-12){
-      // minimal (a,b) with a*vx + b*vy + vw = 0  ->  (a,b) = -vw*(vx,vy)/d2
-      const a = -vw*vx/d2, b = -vw*vy/d2;
-      if(isFinite(a) && isFinite(b)) Hc = [1,0,0, 0,1,0, a,b,1];
-    }
-  }
-
-  // blend toward identity by "amount"
   const t = state.amount/100;
-  if(t < 1){
-    Hc = [1,0,0, 0,1,0, Hc[6]*t, Hc[7]*t, 1];
+
+  /* ---- stage 1: projective ---- */
+  let Hp = IDENT.slice();
+  if(VPv && VPh){
+    const l = cross(VPv, VPh);
+    if(Math.abs(l[2]) > 1e-9){
+      const a = l[0]/l[2], b = l[1]/l[2];
+      if(isFinite(a) && isFinite(b)) Hp = [1,0,0, 0,1,0, a*t, b*t, 1];
+    }
+  } else {
+    const VP = VPv || VPh;
+    const d2 = VP[0]*VP[0] + VP[1]*VP[1];
+    if(d2 > 1e-9 && Math.abs(VP[2]) > 1e-12){
+      const a = -VP[2]*VP[0]/d2, b = -VP[2]*VP[1]/d2;
+      if(isFinite(a) && isFinite(b)) Hp = [1,0,0, 0,1,0, a*t, b*t, 1];
+    }
   }
-  return matMul(fromC, matMul(Hc, toC));
+
+  /* ---- stage 2: metric ---- */
+  const meanDir = (segs, vertical) => {
+    let sx=0, sy=0;
+    for(const g of segs){
+      const p1 = matApply(Hp, g.x1-cx, g.y1-cy);
+      const p2 = matApply(Hp, g.x2-cx, g.y2-cy);
+      let dx = p2[0]-p1[0], dy = p2[1]-p1[1];
+      if(vertical){ if(dy<0){ dx=-dx; dy=-dy; } }
+      else        { if(dx<0){ dx=-dx; dy=-dy; } }
+      const n = Math.hypot(dx,dy);
+      if(n > 1e-9){ sx += dx/n; sy += dy/n; }
+    }
+    const n = Math.hypot(sx,sy);
+    return n > 1e-9 ? [sx/n, sy/n] : null;
+  };
+
+  let A = IDENT.slice();
+  const dv = vs.length ? meanDir(vs,true) : null;
+  const dh = hs.length ? meanDir(hs,false) : null;
+
+  if(dv && dh){
+    const det = dh[0]*dv[1] - dv[0]*dh[1];
+    if(Math.abs(det) > 1e-6){
+      let a11= dv[1]/det, a12=-dv[0]/det, a21=-dh[1]/det, a22= dh[0]/det;
+      const s = 1/Math.sqrt(Math.abs(a11*a22 - a12*a21) || 1); // preserve area
+      a11*=s; a12*=s; a21*=s; a22*=s;
+      A = [ 1+(a11-1)*t, a12*t, 0,  a21*t, 1+(a22-1)*t, 0,  0,0,1 ];
+    }
+  } else if(dv || dh){
+    // single direction: rotation only, nothing constrains the other axis
+    let ang = dv ? Math.atan2(dv[0], dv[1]) : -Math.atan2(dh[1], dh[0]);
+    ang *= t;
+    const c = Math.cos(ang), s = Math.sin(ang);
+    A = [c,-s,0, s,c,0, 0,0,1];
+  }
+
+  return matMul(fromC, matMul(matMul(A, Hp), toC));
 }
 
 // full transform: Fit * Scale * Rot * H   (all in view coords)
@@ -430,7 +505,7 @@ function onUp(){
     } else {
       const dir = classify(a.x,a.y,b.x,b.y);
       const same = state.guides.filter(g=>g.dir===dir);
-      if(same.length >= 2){
+      if(same.length >= MAX_PER_DIR){
         const idx = state.guides.indexOf(same[0]);
         state.guides.splice(idx,1);
       }
