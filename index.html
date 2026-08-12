@@ -180,7 +180,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.5.0';
+const VERSION = 'v0.6.0';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -502,23 +502,55 @@ function toImageSpace(p){
 // on a small phone screen without a conflicting pinch/pan gesture ----
 const loupeEl = document.getElementById('loupe');
 const loupeCtx = document.getElementById('loupeCanvas').getContext('2d');
-const LOUPE_SRC_RADIUS = 26; // px, in previewCanvas units
-function updateLoupe(screenPt){
+const LOUPE_ZOOM = 3;   // magnification relative to what's on screen
+
+// The loupe must show what is under the finger ON SCREEN, i.e. the warped image,
+// not an axis-aligned crop of the undistorted source. We linearize the current
+// transform around the touch point (numeric Jacobian) and feed that affine to
+// canvas2d, so orientation and scale match the display locally.
+// `M` must be the SAME matrix the rest of the gesture uses — during a corner drag
+// that is the frozen one, otherwise handle and loupe drift apart.
+function updateLoupe(screenPt, M){
   if(!state.previewCanvas) return;
-  const imgPt = toImageSpace(screenPt);
-  const scale = state.previewCanvas.width / state.viewW;
-  const cx = imgPt.x*scale, cy = imgPt.y*scale;
-  loupeCtx.imageSmoothingEnabled = true;
+  M = M || buildMatrix();
+  const Minv = matInv(M);
+  if(!Minv) return;
+
+  const s = state.previewCanvas.width / state.viewW;   // view px -> preview px
+  const p0 = matApply(Minv, screenPt.x, screenPt.y);
+  const px = matApply(Minv, screenPt.x+1, screenPt.y); // d(image)/d(screen_x)
+  const py = matApply(Minv, screenPt.x, screenPt.y+1); // d(image)/d(screen_y)
+
+  // Jinv = d(image)/d(screen); invert it to get J = d(screen)/d(image)
+  const a=px[0]-p0[0], b=py[0]-p0[0], c=px[1]-p0[1], d=py[1]-p0[1];
+  const det = a*d - b*c;
+  if(!isFinite(det) || Math.abs(det) < 1e-12) return;
+  const j11= d/det, j12=-b/det, j21=-c/det, j22= a/det;
+
+  // loupe = 66 + (Z/s) * J * (preview - s*p0)
+  const k = LOUPE_ZOOM / s;
+  const K11=k*j11, K12=k*j12, K21=k*j21, K22=k*j22;
+  const sx = s*p0[0], sy = s*p0[1];
+  const tx = 66 - (K11*sx + K12*sy);
+  const ty = 66 - (K21*sx + K22*sy);
+
+  loupeCtx.setTransform(1,0,0,1,0,0);
   loupeCtx.clearRect(0,0,132,132);
+  loupeCtx.fillStyle = '#000';
+  loupeCtx.fillRect(0,0,132,132);
+  loupeCtx.imageSmoothingEnabled = true;
   loupeCtx.save();
   loupeCtx.beginPath(); loupeCtx.arc(66,66,66,0,Math.PI*2); loupeCtx.clip();
-  loupeCtx.drawImage(state.previewCanvas,
-    cx-LOUPE_SRC_RADIUS, cy-LOUPE_SRC_RADIUS, LOUPE_SRC_RADIUS*2, LOUPE_SRC_RADIUS*2,
-    0,0,132,132);
+  loupeCtx.setTransform(K11,K21,K12,K22,tx,ty);
+  loupeCtx.drawImage(state.previewCanvas,0,0);
   loupeCtx.restore();
-  // position: centered horizontally on the touch point, floating above the finger
+  loupeCtx.setTransform(1,0,0,1,0,0);
+
+  // keep the loupe inside the viewport instead of running off the top edge
+  const above = screenPt.y - 28 > 150;
   loupeEl.style.left = screenPt.x+'px';
-  loupeEl.style.top = (screenPt.y-28)+'px';
+  loupeEl.style.top  = (above ? screenPt.y-28 : screenPt.y+28)+'px';
+  loupeEl.style.transform = above ? 'translate(-50%,-100%)' : 'translate(-50%,0)';
   loupeEl.style.display = 'block';
 }
 function hideLoupe(){ loupeEl.style.display = 'none'; }
@@ -533,6 +565,7 @@ let cur = null;        // live screen point during the current gesture
 
 let dragCorner = -1;      // index of the corner being dragged, -1 = none
 let frozenMatrix = null;  // transform snapshot held during a corner drag
+let grabOffset = null;    // image-space delta finger->handle, so it doesn't jump
 
 function onDown(e){
   if(!state.bitmap) return;
@@ -549,10 +582,18 @@ function onDown(e){
       const d = Math.hypot(s[0]-cur.x, s[1]-cur.y);
       if(d < bestD){ bestD = d; best = i; }
     });
-    if(bestD > 44) return;            // missed every handle
+    if(bestD > 60){
+      statusEl.textContent = 'Tocca più vicino a una maniglia per trascinarla.';
+      return;
+    }
     dragCorner = best;
     frozenMatrix = M;                 // freeze so the handle tracks the finger 1:1
-    updateLoupe(cur);
+    const Minv = matInv(M);
+    const fingerImg = Minv ? matApply(Minv, cur.x, cur.y) : [0,0];
+    // keep the handle where it is relative to the finger: no jump on grab
+    grabOffset = [ state.corners[best][0]-fingerImg[0],
+                   state.corners[best][1]-fingerImg[1] ];
+    updateLoupe(cur, frozenMatrix);
     drawGuides();
     return;
   }
@@ -571,10 +612,10 @@ function onMove(e){
     const Minv = matInv(frozenMatrix);
     if(Minv){
       const p = matApply(Minv, cur.x, cur.y);
-      state.corners[dragCorner] = [p[0], p[1]];
+      state.corners[dragCorner] = [ p[0]+grabOffset[0], p[1]+grabOffset[1] ];
       drawGuides();                   // handles move, image stays frozen
     }
-    updateLoupe(cur);
+    updateLoupe(cur, frozenMatrix);   // SAME matrix as the handle, or they drift
     return;
   }
 
@@ -593,7 +634,7 @@ function drawLive(){
 }
 function onUp(){
   if(dragCorner >= 0){
-    dragCorner = -1; frozenMatrix = null;
+    dragCorner = -1; frozenMatrix = null; grabOffset = null;
     hideLoupe(); render();            // now re-warp with the new corner
     statusEl.textContent = 'Angoli aggiornati.';
     return;
@@ -634,6 +675,7 @@ window.addEventListener('mouseup', onUp);
 viewport.addEventListener('touchstart', onDown, {passive:false});
 window.addEventListener('touchmove', onMove, {passive:false});
 window.addEventListener('touchend', onUp);
+window.addEventListener('touchcancel', onUp);
 
 undoBtn.addEventListener('click', ()=>{ state.guides.pop(); render(); });
 const modeSeg = document.getElementById('modeSeg');
