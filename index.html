@@ -189,7 +189,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.9.3';
+const VERSION = 'v0.9.5';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -814,6 +814,21 @@ function updateLoupeFromCanvas(target, anchor){
   loupeEl.style.display='block';
 }
 
+// The preview samples state.previewCanvas — a 2D canvas, therefore colour-managed
+// and converted to sRGB by the browser. Both export paths sampled state.bitmap
+// straight into a WebGL texture, where no colour conversion is applied: an iPhone
+// Display P3 photo then had its raw P3 numbers written out untagged as sRGB, so the
+// exported colours did not match the preview. Route every path through the same
+// 2D canvas so preview and export are colorimetrically identical.
+function fullResSource(){
+  const c=document.createElement('canvas');
+  c.width=state.fullW; c.height=state.fullH;
+  const cx=c.getContext('2d');
+  cx.drawImage(state.bitmap,0,0);
+  return c;
+}
+function releaseSource(c){ try{ c.width=1; c.height=1; }catch(_){} }
+
 // full-resolution mesh bake, banded like the homography path
 async function warpMeshFullRes(){
   const w=state.fullW, h=state.fullH, BAND=256;
@@ -825,7 +840,9 @@ async function warpMeshFullRes(){
   if(Math.max(w,h)>maxTex) throw new Error(`immagine oltre MAX_TEXTURE_SIZE (${maxTex})`);
 
   const prog=buildMeshProgram(gl);
-  const g=Object.assign({prog}, meshGLSetup(gl, prog, state.bitmap));
+  const src=fullResSource();
+  const g=Object.assign({prog}, meshGLSetup(gl, prog, src));
+  releaseSource(src);
   const k=w/state.viewW;
   uploadLmStatic(gl,g);
   gl.bindBuffer(gl.ARRAY_BUFFER, g.vbo);
@@ -1287,15 +1304,26 @@ function layout(){
   // Guides and corners are stored in VIEW coordinates, which change whenever the
   // display size changes (phone rotation, browser chrome collapsing, split view).
   // Without rescaling they would silently point at the wrong features.
-  if(state.viewW && state.viewH && (newW!==state.viewW || newH!==state.viewH)){
+  const resized = state.viewW && state.viewH && (newW!==state.viewW || newH!==state.viewH);
+  if(resized){
     const kx=newW/state.viewW, ky=newH/state.viewH;
     state.guides.forEach(g=>{ g.x1*=kx; g.y1*=ky; g.x2*=kx; g.y2*=ky; });
     if(state.corners) state.corners = state.corners.map(p=>[p[0]*kx, p[1]*ky]);
     if(state.mlines) state.mlines.forEach(L=>{ L.x1*=kx; L.y1*=ky; L.x2*=kx; L.y2*=ky; });
-    lmSolver=null; if(state.mode==='mesh') lmSolve();
   }
 
   state.viewW=newW; state.viewH=newH;
+
+  // Re-solve AFTER the new size is in state. Solving before it meant the solver
+  // was built on the old grid while the lines had already been rescaled to the new
+  // one; the next lmEnsure() then saw mismatched dimensions, rebuilt, and set
+  // lmSol=null — silently discarding the whole solution. On iOS this fires exactly
+  // when you scroll down to reach the export button, because collapsing the Safari
+  // toolbar resizes the viewport.
+  if(resized){
+    lmSolver=null;
+    if(state.mode==='mesh' && (state.mlines||[]).length) lmSolve();
+  }
   viewport.style.width=state.viewW+'px'; viewport.style.height=state.viewH+'px';
   imgEl.style.width=state.viewW+'px'; imgEl.style.height=state.viewH+'px';
   guideSvg.setAttribute('width',state.viewW); guideSvg.setAttribute('height',state.viewH);
@@ -1363,7 +1391,9 @@ async function warpFullResGL(Hfull){
   const tex=gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D,tex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
-  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,state.bitmap);
+  const src=fullResSource();
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,src);
+  releaseSource(src);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
@@ -1472,6 +1502,9 @@ async function doExport(){
   statusEl.textContent='Warp a piena risoluzione…';
   let rgb;
   if(state.mode==='mesh'){
+    // last-resort guard: if anything invalidated the solution, rebuild it rather
+    // than silently exporting an unwarped image
+    if(!lmSol && (state.mlines||[]).length) lmSolve();
     rgb = await warpMeshFullRes();
   } else
   try{ rgb = await warpFullResGL(Hfull); }
