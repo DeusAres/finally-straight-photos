@@ -40,12 +40,13 @@
     isolation:isolate;border-radius:2px;box-shadow:var(--shadow);}
   #imgLayer{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform;z-index:1;}
   #imgLayer img{display:block;user-select:none;-webkit-user-drag:none;position:absolute;top:0;left:0;}
-  #guideSvg{position:absolute;top:0;left:0;overflow:visible;}
+  #guideSvg{position:absolute;top:0;left:0;overflow:visible;pointer-events:none;}
   #guideSvg line{stroke-width:2.5;vector-effect:non-scaling-stroke;
     filter:drop-shadow(0 1px 2px rgba(0,0,0,.6));}
   #guideSvg line.v{stroke:var(--vert);}
   #guideSvg line.h{stroke:var(--horiz);}
   #guideSvg circle{r:5.5;vector-effect:non-scaling-stroke;stroke:rgba(0,0,0,.5);stroke-width:1.5;}
+  #guideSvg circle.handle{r:11;stroke-width:2.5;}
   #guideSvg circle.v{fill:var(--vert);}
   #guideSvg circle.h{fill:var(--horiz);}
 
@@ -57,7 +58,7 @@
     filter:drop-shadow(0 1px 3px rgba(0,0,0,.7));}
 
   /* magnifier loupe, shown while dragging a guide */
-  #loupe{position:absolute;width:132px;height:132px;border-radius:50%;
+  #loupe{position:absolute;box-sizing:content-box;width:132px;height:132px;border-radius:50%;
     border:2.5px solid rgba(255,255,255,.92);box-shadow:0 6px 20px rgba(0,0,0,.5),0 0 0 1px rgba(0,0,0,.3);
     overflow:hidden;pointer-events:none;z-index:10;display:none;
     transform:translate(-50%,-100%);isolation:isolate;background:#000;}
@@ -180,7 +181,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.6.0';
+const VERSION = 'v0.7.0';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -484,8 +485,19 @@ function drawGuides(){
   undoBtn.disabled = clearBtn.disabled = state.guides.length===0;
 }
 
+let activeTouchId = null;
 function viewPoint(e){
-  const t = e.touches ? e.touches[0] : e;
+  let t = e;
+  if(e.touches){
+    t = null;
+    const list = e.changedTouches && e.changedTouches.length ? e.changedTouches : e.touches;
+    if(activeTouchId !== null){
+      for(let i=0;i<list.length;i++) if(list[i].identifier===activeTouchId){ t=list[i]; break; }
+      if(!t) for(let i=0;i<e.touches.length;i++) if(e.touches[i].identifier===activeTouchId){ t=e.touches[i]; break; }
+    }
+    if(!t) t = e.touches[0] || list[0];
+    if(!t) return null;
+  }
   const r = viewport.getBoundingClientRect();
   return {x:t.clientX-r.left, y:t.clientY-r.top};
 }
@@ -510,16 +522,21 @@ const LOUPE_ZOOM = 3;   // magnification relative to what's on screen
 // canvas2d, so orientation and scale match the display locally.
 // `M` must be the SAME matrix the rest of the gesture uses — during a corner drag
 // that is the frozen one, otherwise handle and loupe drift apart.
-function updateLoupe(screenPt, M){
+// `target` is the point whose neighbourhood is shown under the crosshair — during a
+// corner drag that is the HANDLE, not the finger (they differ by the grab offset,
+// and centering on the finger is why the crosshair showed the wrong spot).
+// `anchor` is where the bubble floats on screen; defaults to the target.
+function updateLoupe(target, M, anchor){
   if(!state.previewCanvas) return;
   M = M || buildMatrix();
+  anchor = anchor || target;
   const Minv = matInv(M);
   if(!Minv) return;
 
   const s = state.previewCanvas.width / state.viewW;   // view px -> preview px
-  const p0 = matApply(Minv, screenPt.x, screenPt.y);
-  const px = matApply(Minv, screenPt.x+1, screenPt.y); // d(image)/d(screen_x)
-  const py = matApply(Minv, screenPt.x, screenPt.y+1); // d(image)/d(screen_y)
+  const p0 = matApply(Minv, target.x, target.y);
+  const px = matApply(Minv, target.x+1, target.y);     // d(image)/d(screen_x)
+  const py = matApply(Minv, target.x, target.y+1);     // d(image)/d(screen_y)
 
   // Jinv = d(image)/d(screen); invert it to get J = d(screen)/d(image)
   const a=px[0]-p0[0], b=py[0]-p0[0], c=px[1]-p0[1], d=py[1]-p0[1];
@@ -547,9 +564,9 @@ function updateLoupe(screenPt, M){
   loupeCtx.setTransform(1,0,0,1,0,0);
 
   // keep the loupe inside the viewport instead of running off the top edge
-  const above = screenPt.y - 28 > 150;
-  loupeEl.style.left = screenPt.x+'px';
-  loupeEl.style.top  = (above ? screenPt.y-28 : screenPt.y+28)+'px';
+  const above = anchor.y - 28 > 150;
+  loupeEl.style.left = anchor.x+'px';
+  loupeEl.style.top  = (above ? anchor.y-28 : anchor.y+28)+'px';
   loupeEl.style.transform = above ? 'translate(-50%,-100%)' : 'translate(-50%,0)';
   loupeEl.style.display = 'block';
 }
@@ -565,15 +582,24 @@ let cur = null;        // live screen point during the current gesture
 
 let dragCorner = -1;      // index of the corner being dragged, -1 = none
 let frozenMatrix = null;  // transform snapshot held during a corner drag
-let grabOffset = null;    // image-space delta finger->handle, so it doesn't jump
+let grabOffset = null;    // SCREEN-space delta finger->handle. Must be screen, not
+                          // image: a constant image-space offset maps to a varying
+                          // screen offset under a projective transform, so the handle
+                          // would slowly drift away from the finger as you drag.
 
 function onDown(e){
   if(!state.bitmap) return;
+  if(e.touches){
+    if(activeTouchId !== null) return;          // a gesture is already running
+    const t = e.changedTouches && e.changedTouches[0];
+    activeTouchId = t ? t.identifier : null;
+  }
   e.preventDefault();
   cur = viewPoint(e);
+  if(!cur){ activeTouchId=null; return; }
 
   if(state.mode === 'corners'){
-    if(!state.corners) return;
+    if(!state.corners){ activeTouchId=null; return; }
     // hit-test in SCREEN space so the tolerance is a real finger radius
     const M = buildMatrix();
     let best=-1, bestD=Infinity;
@@ -584,16 +610,14 @@ function onDown(e){
     });
     if(bestD > 60){
       statusEl.textContent = 'Tocca più vicino a una maniglia per trascinarla.';
-      return;
+      activeTouchId=null; return;
     }
     dragCorner = best;
     frozenMatrix = M;                 // freeze so the handle tracks the finger 1:1
-    const Minv = matInv(M);
-    const fingerImg = Minv ? matApply(Minv, cur.x, cur.y) : [0,0];
+    const hs = matApply(M, state.corners[best][0], state.corners[best][1]);
     // keep the handle where it is relative to the finger: no jump on grab
-    grabOffset = [ state.corners[best][0]-fingerImg[0],
-                   state.corners[best][1]-fingerImg[1] ];
-    updateLoupe(cur, frozenMatrix);
+    grabOffset = [ hs[0]-cur.x, hs[1]-cur.y ];
+    updateLoupe({x:hs[0], y:hs[1]}, frozenMatrix, cur);
     drawGuides();
     return;
   }
@@ -606,16 +630,21 @@ function onDown(e){
 function onMove(e){
   if(dragCorner < 0 && !phase) return;
   e.preventDefault();
-  cur = viewPoint(e);
+  const np = viewPoint(e);
+  if(!np) return;                                // event for a different finger
+  cur = np;
 
   if(dragCorner >= 0){
     const Minv = matInv(frozenMatrix);
     if(Minv){
-      const p = matApply(Minv, cur.x, cur.y);
-      state.corners[dragCorner] = [ p[0]+grabOffset[0], p[1]+grabOffset[1] ];
+      // target position in SCREEN space -> exact 1:1 tracking, then back to image
+      const tx = cur.x + grabOffset[0], ty = cur.y + grabOffset[1];
+      const p = matApply(Minv, tx, ty);
+      state.corners[dragCorner] = [ p[0], p[1] ];
       drawGuides();                   // handles move, image stays frozen
+      // crosshair follows the HANDLE, bubble follows the finger
+      updateLoupe({x:tx, y:ty}, frozenMatrix, cur);
     }
-    updateLoupe(cur, frozenMatrix);   // SAME matrix as the handle, or they drift
     return;
   }
 
@@ -633,6 +662,7 @@ function drawLive(){
   }
 }
 function onUp(){
+  activeTouchId = null;
   if(dragCorner >= 0){
     dragCorner = -1; frozenMatrix = null; grabOffset = null;
     hideLoupe(); render();            // now re-warp with the new corner
@@ -747,6 +777,7 @@ fileInput.addEventListener('change', async e=>{
   statusEl.textContent='Carico…';
   try{
     const bmp = await createImageBitmap(f,{imageOrientation:'from-image'});
+    if(state.bitmap && state.bitmap.close) state.bitmap.close();
     state.bitmap = bmp; state.fullW=bmp.width; state.fullH=bmp.height;
     state.fileName=(f.name||'image').replace(/\.[^.]+$/,'');
     state.guides.length=0; pendingA=null; phase=null; dragCorner=-1; state.corners=null;
@@ -772,7 +803,18 @@ function layout(){
   const ar=state.fullW/state.fullH;
   let vw=availW, vh=vw/ar;
   if(vh>availH){ vh=availH; vw=vh*ar; }
-  state.viewW=Math.round(vw); state.viewH=Math.round(vh);
+  const newW=Math.round(vw), newH=Math.round(vh);
+
+  // Guides and corners are stored in VIEW coordinates, which change whenever the
+  // display size changes (phone rotation, browser chrome collapsing, split view).
+  // Without rescaling they would silently point at the wrong features.
+  if(state.viewW && state.viewH && (newW!==state.viewW || newH!==state.viewH)){
+    const kx=newW/state.viewW, ky=newH/state.viewH;
+    state.guides.forEach(g=>{ g.x1*=kx; g.y1*=ky; g.x2*=kx; g.y2*=ky; });
+    if(state.corners) state.corners = state.corners.map(p=>[p[0]*kx, p[1]*ky]);
+  }
+
+  state.viewW=newW; state.viewH=newH;
   viewport.style.width=state.viewW+'px'; viewport.style.height=state.viewH+'px';
   imgEl.style.width=state.viewW+'px'; imgEl.style.height=state.viewH+'px';
   guideSvg.setAttribute('width',state.viewW); guideSvg.setAttribute('height',state.viewH);
