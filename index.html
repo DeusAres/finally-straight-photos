@@ -155,6 +155,10 @@
   </div>
 
   <div class="toolbar">
+    <div class="segmented" id="modeSeg">
+      <button data-mode="guides" class="active">Guide</button>
+      <button data-mode="corners">Angoli</button>
+    </div>
     <label class="fileBtn" for="fileInput">📷 Apri</label>
     <input type="file" id="fileInput" accept="image/*">
     <button id="undoBtn" disabled>↩︎ Ultima guida</button>
@@ -176,7 +180,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.4.0';
+const VERSION = 'v0.5.0';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -212,6 +216,8 @@ function cross(p,q){
 
 /* ============================ state ============================ */
 const state = {
+  mode: 'guides',    // 'guides' | 'corners'
+  corners: null,     // [[x,y] x4] in image space, order TL,TR,BR,BL
   guides: [],        // {x1,y1,x2,y2,dir:'v'|'h'}  in VIEW coords (== displayed image px)
   rot: 0, scale: 100, amount: 100,
   fill: 'white', gridMode: 2,
@@ -358,9 +364,54 @@ function computeHomography(){
   return matMul(fromC, matMul(matMul(A, Hp), toC));
 }
 
+/* ============================ 4-point corner mode ============================ */
+// Complementary to guided lines: guides need the vanishing point (works when the
+// plane extends past the frame, e.g. a facade shot from below), corners work when
+// the whole plane is visible in frame (a ceiling, a painting, a document).
+// Homography from 4 correspondences via DLT, h8 fixed to 1 -> 8x8 linear system.
+function solveH4(src,dst){
+  const A=[],b=[];
+  for(let i=0;i<4;i++){
+    const x=src[i][0], y=src[i][1], u=dst[i][0], v=dst[i][1];
+    A.push([x,y,1,0,0,0,-u*x,-u*y]); b.push(u);
+    A.push([0,0,0,x,y,1,-v*x,-v*y]); b.push(v);
+  }
+  for(let c=0;c<8;c++){
+    let piv=c;
+    for(let r=c+1;r<8;r++) if(Math.abs(A[r][c])>Math.abs(A[piv][c])) piv=r;
+    if(Math.abs(A[piv][c])<1e-12) return null;
+    const tA=A[c]; A[c]=A[piv]; A[piv]=tA;
+    const tb=b[c]; b[c]=b[piv]; b[piv]=tb;
+    for(let r=0;r<8;r++){
+      if(r===c) continue;
+      const f=A[r][c]/A[c][c];
+      if(!f) continue;
+      for(let k=c;k<8;k++) A[r][k]-=f*A[c][k];
+      b[r]-=f*b[c];
+    }
+  }
+  const h=b.map((v,i)=>v/A[i][i]);
+  const M=[h[0],h[1],h[2], h[3],h[4],h[5], h[6],h[7], 1];
+  return M.every(isFinite) ? M : null;
+}
+
+function computeCornerH(){
+  const c = state.corners;
+  if(!c) return IDENT.slice();
+  // target: axis-aligned bounding box of the dragged quad
+  const xs=c.map(p=>p[0]), ys=c.map(p=>p[1]);
+  const minX=Math.min.apply(null,xs), maxX=Math.max.apply(null,xs);
+  const minY=Math.min.apply(null,ys), maxY=Math.max.apply(null,ys);
+  const dst=[[minX,minY],[maxX,minY],[maxX,maxY],[minX,maxY]];
+  // amount blends the TARGET toward the source, so t=0 is exactly identity
+  const t=state.amount/100;
+  const tgt=dst.map((p,i)=>[ c[i][0]+(p[0]-c[i][0])*t, c[i][1]+(p[1]-c[i][1])*t ]);
+  return solveH4(c,tgt) || IDENT.slice();
+}
+
 // full transform: Fit * Scale * Rot * H   (all in view coords)
 function buildMatrix(){
-  const H = computeHomography();
+  const H = state.mode==='corners' ? computeCornerH() : computeHomography();
   const cx = state.viewW/2, cy = state.viewH/2;
   const th = state.rot * Math.PI/180, cs = Math.cos(th), sn = Math.sin(th);
   const R = matMul([1,0,cx, 0,1,cy, 0,0,1],
@@ -404,6 +455,23 @@ function classify(x1,y1,x2,y2){
 }
 function drawGuides(){
   let s = '';
+  if(state.mode === 'corners'){
+    if(state.corners){
+      const c = state.corners;
+      s += `<polygon points="${c.map(p=>p[0]+','+p[1]).join(' ')}" `
+         + `fill="rgba(91,140,255,.10)" stroke="#5b8cff" stroke-width="2" `
+         + `stroke-dasharray="7 5" vector-effect="non-scaling-stroke"/>`;
+      c.forEach((p,i)=>{
+        s += `<circle class="handle" cx="${p[0]}" cy="${p[1]}" r="9" `
+           + `fill="${i===dragCorner?'#fff':'#5b8cff'}" stroke="rgba(0,0,0,.55)" stroke-width="2"/>`;
+      });
+    }
+    guideSvg.innerHTML = s;
+    guideCount.textContent = '4 angoli';
+    undoBtn.disabled = true;
+    clearBtn.disabled = !state.corners;
+    return;
+  }
   for(const g of state.guides){
     s += `<line class="${g.dir}" x1="${g.x1}" y1="${g.y1}" x2="${g.x2}" y2="${g.y2}"/>`
        + `<circle class="${g.dir}" cx="${g.x1}" cy="${g.y1}"/>`
@@ -463,18 +531,53 @@ let pendingA = null;   // image-space {x,y} once point A is confirmed
 let phase = null;      // null | 'A' | 'B'
 let cur = null;        // live screen point during the current gesture
 
+let dragCorner = -1;      // index of the corner being dragged, -1 = none
+let frozenMatrix = null;  // transform snapshot held during a corner drag
+
 function onDown(e){
   if(!state.bitmap) return;
   e.preventDefault();
   cur = viewPoint(e);
+
+  if(state.mode === 'corners'){
+    if(!state.corners) return;
+    // hit-test in SCREEN space so the tolerance is a real finger radius
+    const M = buildMatrix();
+    let best=-1, bestD=Infinity;
+    state.corners.forEach((p,i)=>{
+      const s = matApply(M, p[0], p[1]);
+      const d = Math.hypot(s[0]-cur.x, s[1]-cur.y);
+      if(d < bestD){ bestD = d; best = i; }
+    });
+    if(bestD > 44) return;            // missed every handle
+    dragCorner = best;
+    frozenMatrix = M;                 // freeze so the handle tracks the finger 1:1
+    updateLoupe(cur);
+    drawGuides();
+    return;
+  }
+
   phase = pendingA ? 'B' : 'A';
   updateLoupe(cur);
   drawLive();
 }
+
 function onMove(e){
-  if(!phase) return;
+  if(dragCorner < 0 && !phase) return;
   e.preventDefault();
   cur = viewPoint(e);
+
+  if(dragCorner >= 0){
+    const Minv = matInv(frozenMatrix);
+    if(Minv){
+      const p = matApply(Minv, cur.x, cur.y);
+      state.corners[dragCorner] = [p[0], p[1]];
+      drawGuides();                   // handles move, image stays frozen
+    }
+    updateLoupe(cur);
+    return;
+  }
+
   updateLoupe(cur);
   drawLive();
 }
@@ -489,6 +592,12 @@ function drawLive(){
   }
 }
 function onUp(){
+  if(dragCorner >= 0){
+    dragCorner = -1; frozenMatrix = null;
+    hideLoupe(); render();            // now re-warp with the new corner
+    statusEl.textContent = 'Angoli aggiornati.';
+    return;
+  }
   if(!phase) return;
   liveSvg.innerHTML = ''; hideLoupe();
 
@@ -527,7 +636,34 @@ window.addEventListener('touchmove', onMove, {passive:false});
 window.addEventListener('touchend', onUp);
 
 undoBtn.addEventListener('click', ()=>{ state.guides.pop(); render(); });
+const modeSeg = document.getElementById('modeSeg');
+const hintEl = document.querySelector('.hint');
+const HINTS = {
+  guides: "Tocca e trascina per posizionare il punto (usa la loupe), rilascia per confermare — poi ripeti per il punto finale. Verde = verticale, giallo = orizzontale. Fino a 4 per direzione (oltre 2 → stima ai minimi quadrati).",
+  corners: "Trascina i 4 angoli sul piano da raddrizzare (soffitto, quadro, documento). Il quadrilatero viene mappato sul rettangolo che lo contiene."
+};
+function initCorners(){
+  const mx = state.viewW*0.12, my = state.viewH*0.12;
+  state.corners = [
+    [mx, my], [state.viewW-mx, my],
+    [state.viewW-mx, state.viewH-my], [mx, state.viewH-my]
+  ];
+}
+modeSeg.addEventListener('click', e=>{
+  const b = e.target.closest('button[data-mode]'); if(!b) return;
+  state.mode = b.dataset.mode;
+  [...modeSeg.querySelectorAll('button')].forEach(x=>x.classList.toggle('active', x===b));
+  hintEl.textContent = HINTS[state.mode];
+  pendingA=null; phase=null; dragCorner=-1; liveSvg.innerHTML=''; hideLoupe();
+  if(state.mode==='corners' && !state.corners && state.bitmap) initCorners();
+  render();
+  statusEl.textContent = state.mode==='corners'
+    ? 'Trascina gli angoli sul piano da raddrizzare.'
+    : 'Traccia le guide su elementi verticali od orizzontali.';
+});
+
 clearBtn.addEventListener('click', ()=>{
+  if(state.mode==='corners'){ initCorners(); render(); statusEl.textContent='Angoli reimpostati.'; return; }
   state.guides.length=0; pendingA=null; phase=null; liveSvg.innerHTML=''; hideLoupe();
   render(); statusEl.textContent='';
 });
@@ -571,7 +707,8 @@ fileInput.addEventListener('change', async e=>{
     const bmp = await createImageBitmap(f,{imageOrientation:'from-image'});
     state.bitmap = bmp; state.fullW=bmp.width; state.fullH=bmp.height;
     state.fileName=(f.name||'image').replace(/\.[^.]+$/,'');
-    state.guides.length=0; pendingA=null; phase=null; liveSvg.innerHTML=''; hideLoupe();
+    state.guides.length=0; pendingA=null; phase=null; dragCorner=-1; state.corners=null;
+    liveSvg.innerHTML=''; hideLoupe();
 
     const s = Math.min(1, PREVIEW_CAP/Math.max(bmp.width,bmp.height));
     const pw=Math.max(1,Math.round(bmp.width*s)), ph=Math.max(1,Math.round(bmp.height*s));
@@ -597,6 +734,7 @@ function layout(){
   viewport.style.width=state.viewW+'px'; viewport.style.height=state.viewH+'px';
   imgEl.style.width=state.viewW+'px'; imgEl.style.height=state.viewH+'px';
   guideSvg.setAttribute('width',state.viewW); guideSvg.setAttribute('height',state.viewH);
+  if(state.mode==='corners' && !state.corners) initCorners();
   drawGrid(); render();
 }
 window.addEventListener('resize', layout);
