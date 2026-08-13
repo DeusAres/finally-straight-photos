@@ -38,6 +38,9 @@
      matrix3d layer below can't disturb sibling paint order (WebKit stacking quirk) */
   #viewport{position:relative;overflow:hidden;touch-action:none;background:#fff;
     isolation:isolate;border-radius:2px;box-shadow:var(--shadow);}
+  /* pan/zoom is a VIEW transform only: it wraps the content so it can never leak
+     into the correction maths or the exported image */
+  #panZoom{position:absolute;top:0;left:0;width:100%;height:100%;transform-origin:0 0;will-change:transform;}
   #imgLayer{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform;z-index:1;}
   #imgLayer img{display:block;user-select:none;-webkit-user-drag:none;position:absolute;top:0;left:0;}
   #guideSvg{position:absolute;top:0;left:0;overflow:visible;pointer-events:none;}
@@ -74,6 +77,9 @@
   #loupe .cross::before{left:50%;top:0;width:1.5px;height:100%;transform:translateX(-50%);}
   #loupe .cross::after{top:50%;left:0;height:1.5px;width:100%;transform:translateY(-50%);}
 
+  #zoomBadge{position:absolute;top:8px;right:8px;z-index:8;display:none;
+    background:rgba(0,0,0,.62);backdrop-filter:blur(8px);color:#fff;font-size:12px;font-weight:600;
+    padding:6px 10px;border-radius:14px;border:1px solid rgba(255,255,255,.18);cursor:pointer;}
   #placeholder{color:var(--dim);font-size:14px;text-align:center;padding:24px;pointer-events:none;line-height:1.65;}
   #placeholder b{color:var(--fg);font-weight:600;}
 
@@ -133,14 +139,17 @@
     <span style="font-size:12px">poi traccia linee lungo elementi che <b>devono</b> essere<br>
     verticali (spigoli, stipiti) od orizzontali (cornicioni, davanzali)</span></div>
   <div id="viewport">
-    <div id="imgLayer">
-      <img id="img" alt="">
-      <svg id="guideSvg"></svg>
+    <div id="panZoom">
+      <div id="imgLayer">
+        <img id="img" alt="">
+        <svg id="guideSvg"></svg>
+      </div>
+      <canvas id="meshCanvas"></canvas>
+      <svg id="meshSvg"></svg>
     </div>
-    <canvas id="meshCanvas"></canvas>
-    <svg id="meshSvg"></svg>
     <svg id="gridSvg"></svg>
     <svg id="liveSvg"></svg>
+    <div id="zoomBadge">1.0×  ·  reset</div>
     <div id="loupe"><canvas id="loupeCanvas" width="132" height="132"></canvas><div class="cross"></div></div>
   </div>
 </div>
@@ -189,7 +198,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.9.6';
+const VERSION = 'v0.10.0';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -226,7 +235,7 @@ function cross(p,q){
 /* ============================ state ============================ */
 const state = {
   mode: 'guides',    // 'guides' | 'corners' | 'mesh'
-  mlines: [], texDirty: true,
+  mlines: [], texDirty: true, zoom: 1, pan: {x:0,y:0},
   corners: null,     // [[x,y] x4] in image space, order TL,TR,BR,BL
   guides: [],        // {x1,y1,x2,y2,dir:'v'|'h'}  in VIEW coords (== displayed image px)
   rot: 0, scale: 100, amount: 100,
@@ -799,7 +808,8 @@ function drawMeshHandles(){
 function updateLoupeFromCanvas(target, anchor){
   if(!meshCanvas.width) return;
   const dpr = meshCanvas.width/state.viewW;
-  const r = 22*dpr;
+  // 22 screen px worth of content, which shrinks as the view zooms in
+  const r = 22*dpr/state.zoom;
   loupeCtx.setTransform(1,0,0,1,0,0);
   loupeCtx.clearRect(0,0,132,132);
   loupeCtx.fillStyle='#000'; loupeCtx.fillRect(0,0,132,132);
@@ -959,6 +969,72 @@ function drawGuides(){
   undoBtn.disabled = clearBtn.disabled = state.guides.length===0;
 }
 
+/* ============================ view pan / zoom ============================
+   Purely a way of LOOKING at the picture: it never enters buildMatrix, the mesh
+   solve or the export. Screen coordinates therefore have to be converted into
+   content coordinates before any hit-test or inverse mapping. */
+const panZoomEl = document.getElementById('panZoom');
+const zoomBadge = document.getElementById('zoomBadge');
+const MIN_ZOOM = 1, MAX_ZOOM = 8;
+
+function applyPanZoom(){
+  const z = state.zoom;
+  // keep the content covering the viewport instead of drifting off-screen
+  const minX = state.viewW*(1-z), minY = state.viewH*(1-z);
+  state.pan.x = Math.min(0, Math.max(minX, state.pan.x));
+  state.pan.y = Math.min(0, Math.max(minY, state.pan.y));
+  panZoomEl.style.transform = `translate(${state.pan.x}px,${state.pan.y}px) scale(${z})`;
+  if(z > 1.01){
+    zoomBadge.textContent = z.toFixed(1)+'\u00d7  \u00b7  reset';
+    zoomBadge.style.display = 'block';
+  } else zoomBadge.style.display = 'none';
+}
+function screenToContent(p){ return {x:(p.x-state.pan.x)/state.zoom, y:(p.y-state.pan.y)/state.zoom}; }
+function contentToScreen(p){
+  const x = (p[0]!==undefined?p[0]:p.x), y = (p[1]!==undefined?p[1]:p.y);
+  return [x*state.zoom+state.pan.x, y*state.zoom+state.pan.y];
+}
+function zoomAt(screenPt, newZoom){
+  const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, newZoom));
+  // keep the point under the fingers pinned while the scale changes
+  state.pan.x = screenPt.x - (screenPt.x-state.pan.x)*(z/state.zoom);
+  state.pan.y = screenPt.y - (screenPt.y-state.pan.y)*(z/state.zoom);
+  state.zoom = z;
+  applyPanZoom();
+}
+function resetView(){ state.zoom=1; state.pan={x:0,y:0}; applyPanZoom(); }
+zoomBadge.addEventListener('click', e=>{ e.stopPropagation(); resetView(); });
+
+let pinch = null;
+function touchPair(e){
+  const a=e.touches[0], b=e.touches[1];
+  const r=viewport.getBoundingClientRect();
+  const p1={x:a.clientX-r.left,y:a.clientY-r.top}, p2={x:b.clientX-r.left,y:b.clientY-r.top};
+  return {dist:Math.hypot(p2.x-p1.x,p2.y-p1.y), mid:{x:(p1.x+p2.x)/2,y:(p1.y+p2.y)/2}};
+}
+function startPinch(e){
+  const t=touchPair(e);
+  pinch={d0:t.dist, mid0:t.mid, z0:state.zoom, pan0:{x:state.pan.x,y:state.pan.y}};
+}
+function movePinch(e){
+  if(e.touches.length<2) return;
+  const t=touchPair(e);
+  if(pinch.d0<1) return;
+  const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, pinch.z0*(t.dist/pinch.d0)));
+  // zoom about the original midpoint, then translate by how far the midpoint moved
+  state.pan.x = pinch.mid0.x - (pinch.mid0.x-pinch.pan0.x)*(z/pinch.z0) + (t.mid.x-pinch.mid0.x);
+  state.pan.y = pinch.mid0.y - (pinch.mid0.y-pinch.pan0.y)*(z/pinch.z0) + (t.mid.y-pinch.mid0.y);
+  state.zoom = z;
+  applyPanZoom();
+}
+
+viewport.addEventListener('wheel', e=>{
+  if(!state.bitmap) return;
+  e.preventDefault();
+  const r=viewport.getBoundingClientRect();
+  zoomAt({x:e.clientX-r.left, y:e.clientY-r.top}, state.zoom*Math.exp(-e.deltaY*0.0015));
+}, {passive:false});
+
 /* ============================ pointer plumbing ============================ */
 let pendingA = null;      // first endpoint, confirmed, in image space
 let phase = null;         // null | 'A' | 'B'
@@ -1015,7 +1091,9 @@ function updateLoupe(target, M, anchor){
   const det = a*d - b*c;
   if(!isFinite(det) || Math.abs(det) < 1e-12) return;
   const j11= d/det, j12=-b/det, j21=-c/det, j22= a/det;
-  const k = LOUPE_ZOOM / s;
+  // magnify relative to what is ON SCREEN, so the loupe keeps a constant power
+  // regardless of the current view zoom
+  const k = LOUPE_ZOOM * state.zoom / s;
   const K11=k*j11, K12=k*j12, K21=k*j21, K22=k*j22;
   const sx = s*p0[0], sy = s*p0[1];
   const tx = 66 - (K11*sx + K12*sy);
@@ -1042,9 +1120,9 @@ function drawLive(){
   if(phase === 'A'){
     liveSvg.innerHTML = `<circle cx="${cur.x}" cy="${cur.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
   } else if(phase === 'B'){
-    const aScreen = state.mode==='mesh'
+    const aScreen = contentToScreen(state.mode==='mesh'
       ? lmMap(pendingA.x, pendingA.y)
-      : matApply(buildMatrix(), pendingA.x, pendingA.y);
+      : matApply(buildMatrix(), pendingA.x, pendingA.y));
     liveSvg.innerHTML =
       `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${cur.x}" y2="${cur.y}"/>
        <circle cx="${aScreen[0]}" cy="${aScreen[1]}" r="6" fill="#fff"/>`;
@@ -1053,6 +1131,13 @@ function drawLive(){
 
 function onDown(e){
   if(!state.bitmap) return;
+  if(e.touches && e.touches.length >= 2){
+    e.preventDefault();
+    startPinch(e);
+    phase=null; dragCorner=-1; frozenMatrix=null; grabOffset=null;
+    activeTouchId=null; liveSvg.innerHTML=''; hideLoupe();
+    return;
+  }
   if(e.touches){
     if(activeTouchId !== null) return;
     const t = e.changedTouches && e.changedTouches[0];
@@ -1064,7 +1149,7 @@ function onDown(e){
 
   if(state.mode === 'mesh'){
     phase = pendingA ? 'B' : 'A';
-    updateLoupeFromCanvas(cur, cur);
+    updateLoupeFromCanvas(screenToContent(cur), cur);
     drawLive();
     return;
   }
@@ -1075,7 +1160,7 @@ function onDown(e){
     const M = buildMatrix();
     let best=-1, bestD=Infinity;
     state.corners.forEach((p,i)=>{
-      const s = matApply(M, p[0], p[1]);
+      const s = contentToScreen(matApply(M, p[0], p[1]));
       const d = Math.hypot(s[0]-cur.x, s[1]-cur.y);
       if(d < bestD){ bestD = d; best = i; }
     });
@@ -1085,20 +1170,23 @@ function onDown(e){
     }
     dragCorner = best;
     frozenMatrix = M;                 // freeze so the handle tracks the finger 1:1
-    const hs = matApply(M, state.corners[best][0], state.corners[best][1]);
+    const hc = matApply(M, state.corners[best][0], state.corners[best][1]);
+    const hs = contentToScreen(hc);
     // keep the handle where it is relative to the finger: no jump on grab
     grabOffset = [ hs[0]-cur.x, hs[1]-cur.y ];
-    updateLoupe({x:hs[0], y:hs[1]}, frozenMatrix, cur);
+    updateLoupe({x:hc[0], y:hc[1]}, frozenMatrix, cur);
     drawGuides();
     return;
   }
 
   phase = pendingA ? 'B' : 'A';
-  if(state.mode==='mesh') updateLoupeFromCanvas(cur, cur); else updateLoupe(cur);
+  const curC = screenToContent(cur);
+  if(state.mode==='mesh') updateLoupeFromCanvas(curC, cur); else updateLoupe(curC, null, cur);
   drawLive();
 }
 
 function onMove(e){
+  if(pinch){ e.preventDefault(); movePinch(e); return; }
   if(dragCorner < 0 && !phase) return;
   e.preventDefault();
   const np = viewPoint(e);
@@ -1109,12 +1197,13 @@ function onMove(e){
     const Minv = matInv(frozenMatrix);
     if(Minv){
       // target position in SCREEN space -> exact 1:1 tracking, then back to image
-      const tx = cur.x + grabOffset[0], ty = cur.y + grabOffset[1];
-      const p = matApply(Minv, tx, ty);
+      const tS = {x: cur.x + grabOffset[0], y: cur.y + grabOffset[1]};
+      const tC = screenToContent(tS);
+      const p = matApply(Minv, tC.x, tC.y);
       state.corners[dragCorner] = [ p[0], p[1] ];
       drawGuides();                   // handles move, image stays frozen
       // crosshair follows the HANDLE, bubble follows the finger
-      updateLoupe({x:tx, y:ty}, frozenMatrix, cur);
+      updateLoupe(tC, frozenMatrix, cur);
     }
     return;
   }
@@ -1126,15 +1215,21 @@ function drawLive(){
   if(phase === 'A'){
     liveSvg.innerHTML = `<circle cx="${cur.x}" cy="${cur.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
   } else if(phase === 'B'){
-    const aScreen = state.mode==='mesh'
+    const aScreen = contentToScreen(state.mode==='mesh'
       ? lmMap(pendingA.x, pendingA.y)
-      : matApply(buildMatrix(), pendingA.x, pendingA.y);
+      : matApply(buildMatrix(), pendingA.x, pendingA.y));
     liveSvg.innerHTML =
       `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${cur.x}" y2="${cur.y}"/>
        <circle cx="${aScreen[0]}" cy="${aScreen[1]}" r="6" fill="#fff"/>`;
   }
 }
-function onUp(){
+function onUp(e){
+  if(pinch){
+    // stay in pinch until fewer than two fingers remain
+    if(e && e.touches && e.touches.length >= 2) return;
+    pinch = null; activeTouchId = null;
+    if(e && e.touches && e.touches.length) return;  // a finger is still down
+  }
   activeTouchId = null;
 
   if(dragCorner >= 0){
@@ -1147,11 +1242,13 @@ function onUp(){
   liveSvg.innerHTML = ''; hideLoupe();
 
   if(phase === 'A'){
-    pendingA = state.mode==='mesh' ? lmInverse(cur.x,cur.y) : toImageSpace(cur);
+    const cC = screenToContent(cur);
+    pendingA = state.mode==='mesh' ? lmInverse(cC.x,cC.y) : toImageSpace(cC);
     phase = null;
     statusEl.textContent = 'Punto iniziale fissato — tocca per posizionare il punto finale.';
   } else if(phase === 'B'){
-    const b = state.mode==='mesh' ? lmInverse(cur.x,cur.y) : toImageSpace(cur);
+    const cC = screenToContent(cur);
+    const b = state.mode==='mesh' ? lmInverse(cC.x,cC.y) : toImageSpace(cC);
     const a = pendingA;
     pendingA = null; phase = null;
     if(Math.hypot(b.x-a.x, b.y-a.y) < 5){
@@ -1190,6 +1287,9 @@ viewport.addEventListener('mousedown', onDown);
 window.addEventListener('mousemove', onMove);
 window.addEventListener('mouseup', onUp);
 viewport.addEventListener('touchstart', onDown, {passive:false});
+window.addEventListener('touchstart', e=>{
+  if(state.bitmap && !pinch && e.touches && e.touches.length>=2) onDown(e);
+}, {passive:false});
 window.addEventListener('touchmove', onMove, {passive:false});
 window.addEventListener('touchend', onUp);
 window.addEventListener('touchcancel', onUp);
@@ -1278,6 +1378,7 @@ fileInput.addEventListener('change', async e=>{
     state.fileName=(f.name||'image').replace(/\.[^.]+$/,'');
     state.guides.length=0; pendingA=null; phase=null; dragCorner=-1; state.corners=null;
     state.mlines=[]; lmSol=null; lmSolver=null; state.texDirty=true; meshGL=null;
+    state.zoom=1; state.pan={x:0,y:0};
     liveSvg.innerHTML=''; hideLoupe();
 
     const s = Math.min(1, PREVIEW_CAP/Math.max(bmp.width,bmp.height));
@@ -1330,6 +1431,7 @@ function layout(){
   guideSvg.setAttribute('width',state.viewW); guideSvg.setAttribute('height',state.viewH);
   if(state.mode==='corners' && !state.corners) initCorners();
 
+  applyPanZoom();
   drawGrid(); render();
 }
 window.addEventListener('resize', layout);
