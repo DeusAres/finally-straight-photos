@@ -9,7 +9,7 @@
     --bg:#08080a; --bg2:#0f0f12; --panel:rgba(20,20,24,.88); --line:rgba(255,255,255,.09);
     --line-strong:rgba(255,255,255,.16); --fg:#f3f3f5; --dim:#8b8b93; --dim2:#5c5c63;
     --accent:#5b8cff; --accent2:#7aa2ff; --vert:#34d399; --horiz:#fbbf24;
-    --r-sm:8px; --r-md:12px; --r-lg:16px;
+    --r-sm:8px; --r-lg:16px;
     --shadow:0 8px 24px rgba(0,0,0,.35);
   }
   *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
@@ -198,7 +198,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.10.4';
+const VERSION = 'v0.11.4';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -417,7 +417,7 @@ function solveH4(src,dst){
 function computeCornerH(){
   const c = state.corners;
   if(!c) return IDENT.slice();
-  // target: axis-aligned bounding box of the dragged quad
+  // targetC: axis-aligned bounding box of the dragged quad
   const xs=c.map(p=>p[0]), ys=c.map(p=>p[1]);
   const minX=Math.min.apply(null,xs), maxX=Math.max.apply(null,xs);
   const minY=Math.min.apply(null,ys), maxY=Math.max.apply(null,ys);
@@ -693,13 +693,19 @@ function buildMeshProgram(gl){
   return prog;
 }
 
-function meshGLSetup(gl, prog, source){
+// Single factory for preview and export. The program lives INSIDE the rig on
+// purpose: the export used to build it separately and forget to attach it, which
+// blew up at getAttribLocation — a crash only reachable by pressing Export.
+function meshRig(gl, source){
+  const prog = buildMeshProgram(gl);
   gl.useProgram(prog);
-  // uv/index buffers are filled later by uploadLmStatic, whose grid size depends
-  // on the image aspect ratio and is therefore not known here
-  const vbo=gl.createBuffer(), uvbo=gl.createBuffer(), ibo=gl.createBuffer();
-  const tex=gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, tex);
+  const rig = {gl, prog,
+    vbo: gl.createBuffer(), uvbo: gl.createBuffer(), ibo: gl.createBuffer(),
+    tex: gl.createTexture(), lmIdxCount: 0, lmCount: -1,
+    uOut:   gl.getUniformLocation(prog,'uOut'),
+    uBandY: gl.getUniformLocation(prog,'uBandY'),
+    aPos:   gl.getAttribLocation(prog,'aPos')};
+  gl.bindTexture(gl.TEXTURE_2D, rig.tex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
   gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE, source);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
@@ -707,10 +713,32 @@ function meshGLSetup(gl, prog, source){
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
   gl.uniform1i(gl.getUniformLocation(prog,'uTex'),0);
-  return {vbo, uvbo, ibo, tex, lmIdxCount:0, lmCount:-1,
-          uOut: gl.getUniformLocation(prog,'uOut'),
-          uBandY: gl.getUniformLocation(prog,'uBandY'),
-          aPos: gl.getAttribLocation(prog,'aPos')};
+  return rig;
+}
+
+// Single draw for preview and export: identical uniform and buffer state, so the
+// two cannot drift apart the way the texture source once did. Pass positions=null
+// to reuse the vertices already uploaded (the export bands share them).
+function meshDraw(rig, positions, outW, outH, bandY){
+  const gl = rig.gl;
+  gl.useProgram(rig.prog);
+  if(rig.lmCount !== lmBufCount()) uploadLmStatic(gl, rig);
+  if(positions){
+    gl.bindBuffer(gl.ARRAY_BUFFER, rig.vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(rig.aPos);
+    gl.vertexAttribPointer(rig.aPos, 2, gl.FLOAT, false, 0, 0);
+  }
+  gl.viewport(0, 0, outW, outH);
+  gl.uniform2f(rig.uOut, outW, outH);
+  gl.uniform1f(rig.uBandY, bandY);
+  const fill = state.fill === 'white' ? 1 : 0;
+  gl.clearColor(fill, fill, fill, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, rig.tex);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, rig.ibo);
+  gl.drawElements(gl.TRIANGLES, rig.lmIdxCount, gl.UNSIGNED_INT, 0);
 }
 
 function getMeshGL(){
@@ -718,8 +746,7 @@ function getMeshGL(){
   const gl = meshCanvas.getContext('webgl2',{antialias:true, preserveDrawingBuffer:true});
   if(!gl) return null;
   try{
-    const prog = buildMeshProgram(gl);
-    meshGL = Object.assign({gl, prog}, meshGLSetup(gl, prog, state.previewCanvas));
+    meshGL = meshRig(gl, state.previewCanvas);
     return meshGL;
   }catch(err){ console.warn('mesh GL init failed:', err); return null; }
 }
@@ -752,27 +779,19 @@ function renderMeshPreview(){
   meshCanvas.style.width = state.viewW+'px';
   meshCanvas.style.height = state.viewH+'px';
   if(meshCanvas.width!==W || meshCanvas.height!==H){ meshCanvas.width=W; meshCanvas.height=H; meshGL=null; }
-  const g = getMeshGL(); if(!g) return;
+  const g = getMeshGL();
+  if(!g){
+    statusEl.textContent = 'Mesh non disponibile: questo browser non espone WebGL2. '
+      + 'Usa Guide o Angoli, che funzionano anche senza GPU.';
+    return;
+  }
   const gl = g.gl;
   if(state.texDirty){
     gl.bindTexture(gl.TEXTURE_2D, g.tex);
     gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE, state.previewCanvas);
     state.texDirty=false;
   }
-  gl.useProgram(g.prog);
-  if(g.lmCount!==lmBufCount()) uploadLmStatic(gl,g);
-  gl.bindBuffer(gl.ARRAY_BUFFER, g.vbo);
-  gl.bufferData(gl.ARRAY_BUFFER, lmPositions(res, meshAffine()), gl.DYNAMIC_DRAW);
-  gl.enableVertexAttribArray(g.aPos);
-  gl.vertexAttribPointer(g.aPos,2,gl.FLOAT,false,0,0);
-  gl.viewport(0,0,W,H);
-  gl.uniform2f(g.uOut, W, H);
-  gl.uniform1f(g.uBandY, 0);
-  const f = state.fill==='white' ? 1 : 0;
-  gl.clearColor(f,f,f,1); gl.clear(gl.COLOR_BUFFER_BIT);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, g.tex);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, g.ibo);
-  gl.drawElements(gl.TRIANGLES, g.lmIdxCount, gl.UNSIGNED_INT, 0);
+  meshDraw(g, lmPositions(res, meshAffine()), W, H, 0);
 }
 
 // source point -> screen, THROUGH the solved mesh. The overlay must use this:
@@ -813,7 +832,7 @@ function drawMeshHandles(){
 
 // loupe in mesh mode: crop straight out of the rendered WebGL canvas, so what the
 // crosshair shows is by construction exactly what is on screen
-function updateLoupeFromCanvas(target, anchor){
+function updateLoupeFromCanvas(targetC, anchorS){
   if(!meshCanvas.width) return;
   const dpr = meshCanvas.width/state.viewW;
   // 22 screen px worth of content, which shrinks as the view zooms in
@@ -824,11 +843,11 @@ function updateLoupeFromCanvas(target, anchor){
   loupeCtx.save();
   loupeCtx.beginPath(); loupeCtx.arc(66,66,66,0,Math.PI*2); loupeCtx.clip();
   loupeCtx.imageSmoothingEnabled = true;
-  loupeCtx.drawImage(meshCanvas, target.x*dpr-r, target.y*dpr-r, 2*r, 2*r, 0,0,132,132);
+  loupeCtx.drawImage(meshCanvas, targetC.x*dpr-r, targetC.y*dpr-r, 2*r, 2*r, 0,0,132,132);
   loupeCtx.restore();
-  const above = anchor.y-28 > 150;
-  loupeEl.style.left = anchor.x+'px';
-  loupeEl.style.top  = (above? anchor.y-28 : anchor.y+28)+'px';
+  const above = anchorS.y-28 > 150;
+  loupeEl.style.left = anchorS.x+'px';
+  loupeEl.style.top  = (above? anchorS.y-28 : anchorS.y+28)+'px';
   loupeEl.style.transform = above? 'translate(-50%,-100%)' : 'translate(-50%,0)';
   loupeEl.style.display='block';
 }
@@ -858,30 +877,17 @@ async function warpMeshFullRes(){
   const maxTex=gl.getParameter(gl.MAX_TEXTURE_SIZE);
   if(Math.max(w,h)>maxTex) throw new Error(`immagine oltre MAX_TEXTURE_SIZE (${maxTex})`);
 
-  const prog=buildMeshProgram(gl);
   const src=fullResSource();
-  const g=Object.assign({prog}, meshGLSetup(gl, prog, src));
+  const g=meshRig(gl, src);
   releaseSource(src);
-  const k=w/state.viewW;
-  uploadLmStatic(gl,g);
-  gl.bindBuffer(gl.ARRAY_BUFFER, g.vbo);
-  gl.bufferData(gl.ARRAY_BUFFER, lmPositions(k, meshAffine()), gl.STATIC_DRAW);
-  gl.enableVertexAttribArray(g.aPos);
-  gl.vertexAttribPointer(g.aPos,2,gl.FLOAT,false,0,0);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, g.tex);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, g.ibo);
-  const f = state.fill==='white'?1:0;
+  const positions=lmPositions(w/state.viewW, meshAffine());
 
   const rgb=new Uint8Array(w*h*3);
   const px=new Uint8Array(w*BAND*4);
   for(let y0=0;y0<h;y0+=BAND){
     const bh=Math.min(BAND,h-y0);
     if(canvas.height!==bh) canvas.height=bh;
-    gl.viewport(0,0,w,bh);
-    gl.uniform2f(g.uOut, w, bh);
-    gl.uniform1f(g.uBandY, y0);
-    gl.clearColor(f,f,f,1); gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.drawElements(gl.TRIANGLES, g.lmIdxCount, gl.UNSIGNED_INT, 0);
+    meshDraw(g, y0===0 ? positions : null, w, bh, y0);
     gl.readPixels(0,0,w,bh,gl.RGBA,gl.UNSIGNED_BYTE,px);
     // vertex shader flips y for screen orientation, so readPixels rows come back
     // bottom-up relative to the band: row r is output row y0 + (bh-1-r)
@@ -892,7 +898,8 @@ async function warpMeshFullRes(){
     statusEl.textContent=`Warp mesh ${Math.round((y0+bh)/h*100)}%…`;
     await new Promise(r=>setTimeout(r,0));
   }
-  gl.deleteTexture(g.tex); gl.deleteBuffer(g.vbo); gl.deleteBuffer(g.ibo); gl.deleteProgram(prog);
+  gl.deleteTexture(g.tex); gl.deleteBuffer(g.vbo); gl.deleteBuffer(g.uvbo);
+  gl.deleteBuffer(g.ibo); gl.deleteProgram(g.prog);
   const lose=gl.getExtension('WEBGL_lose_context'); if(lose) lose.loseContext();
   return rgb;
 }
@@ -993,7 +1000,7 @@ function applyPanZoom(){
   state.pan.x = Math.min(0, Math.max(minX, state.pan.x));
   state.pan.y = Math.min(0, Math.max(minY, state.pan.y));
   panZoomEl.style.transform = `translate(${state.pan.x}px,${state.pan.y}px) scale(${z})`;
-  if(pendingA && !phase) drawPendingMarker();
+  if(pendingImg && !phase) drawPendingMarker();
   if(state.mode==='mesh' && state.bitmap) renderMeshPreview();   // re-resolve at the new zoom
   if(z > 1.01){
     zoomBadge.textContent = z.toFixed(1)+'\u00d7  \u00b7  reset';
@@ -1055,18 +1062,18 @@ viewport.addEventListener('wheel', e=>{
 }, {passive:false});
 
 /* ============================ pointer plumbing ============================ */
-let pendingA = null;      // first endpoint, confirmed, in image space
+let pendingImg = null;      // first endpoint, confirmed, in image space
 let phase = null;         // null | 'A' | 'B'
-let cur = null;           // live screen point during the current gesture
+let curS = null;           // live screen point during the current gesture
 let dragCorner = -1;      // index of the corner being dragged, -1 = none
 let frozenMatrix = null;  // transform snapshot held during a corner drag
-let grabOffset = null;    // SCREEN-space delta finger->handle. Must be screen, not
+let grabOffsetS = null;    // SCREEN-space delta finger->handle. Must be screen, not
                           // image: a constant image-space offset maps to a varying
                           // screen offset under a projective transform, so the handle
                           // would slowly drift away from the finger as you drag.
 let activeTouchId = null;
 
-function viewPoint(e){
+function pointerScreen(e){
   let t = e;
   if(e.touches){
     t = null;
@@ -1083,7 +1090,7 @@ function viewPoint(e){
 }
 
 // map a viewport point back into untransformed image space
-function toImageSpace(p){
+function contentToImage(p){
   const Minv = matInv(buildMatrix());
   if(!Minv) return p;
   const [x,y] = matApply(Minv, p.x, p.y);
@@ -1094,21 +1101,21 @@ const loupeEl = document.getElementById('loupe');
 const loupeCtx = document.getElementById('loupeCanvas').getContext('2d');
 const LOUPE_ZOOM = 3;
 
-// `target` is the point shown under the crosshair — during a corner drag that is
-// the HANDLE, not the finger. `anchor` is where the bubble floats.
-function updateLoupe(target, M, anchor){
+// `targetC` is the point shown under the crosshair — during a corner drag that is
+// the HANDLE, not the finger. `anchorS` is where the bubble floats.
+function updateLoupe(targetC, M, anchorS){
   if(!state.previewCanvas) return;
   M = M || buildMatrix();
-  anchor = anchor || target;
+  anchorS = anchorS || targetC;
   const Minv = matInv(M);
   if(!Minv) return;
   // sample the original image, so the bubble gains detail as you zoom in
   const useFull = !!state.bitmap;
   const srcImg = useFull ? state.bitmap : state.previewCanvas;
   const s = (useFull ? state.fullW : state.previewCanvas.width) / state.viewW;
-  const p0 = matApply(Minv, target.x, target.y);
-  const px = matApply(Minv, target.x+1, target.y);
-  const py = matApply(Minv, target.x, target.y+1);
+  const p0 = matApply(Minv, targetC.x, targetC.y);
+  const px = matApply(Minv, targetC.x+1, targetC.y);
+  const py = matApply(Minv, targetC.x, targetC.y+1);
   const a=px[0]-p0[0], b=py[0]-p0[0], c=px[1]-p0[1], d=py[1]-p0[1];
   const det = a*d - b*c;
   if(!isFinite(det) || Math.abs(det) < 1e-12) return;
@@ -1130,9 +1137,9 @@ function updateLoupe(target, M, anchor){
   loupeCtx.drawImage(srcImg,0,0);
   loupeCtx.restore();
   loupeCtx.setTransform(1,0,0,1,0,0);
-  const above = anchor.y - 28 > 150;
-  loupeEl.style.left = anchor.x+'px';
-  loupeEl.style.top  = (above ? anchor.y-28 : anchor.y+28)+'px';
+  const above = anchorS.y - 28 > 150;
+  loupeEl.style.left = anchorS.x+'px';
+  loupeEl.style.top  = (above ? anchorS.y-28 : anchorS.y+28)+'px';
   loupeEl.style.transform = above ? 'translate(-50%,-100%)' : 'translate(-50%,0)';
   loupeEl.style.display = 'block';
 }
@@ -1141,10 +1148,10 @@ function hideLoupe(){ loupeEl.style.display = 'none'; }
 // marker for a confirmed-but-not-yet-paired first point: without it you lift the
 // finger and nothing shows that the point was registered at all
 function pendingScreen(){
-  if(!pendingA) return null;
+  if(!pendingImg) return null;
   return contentToScreen(state.mode==='mesh'
-    ? lmMap(pendingA.x, pendingA.y)
-    : matApply(buildMatrix(), pendingA.x, pendingA.y));
+    ? lmMap(pendingImg.x, pendingImg.y)
+    : matApply(buildMatrix(), pendingImg.x, pendingImg.y));
 }
 function drawPendingMarker(){
   const p = pendingScreen();
@@ -1156,11 +1163,11 @@ function drawPendingMarker(){
 
 function drawLive(){
   if(phase === 'A'){
-    liveSvg.innerHTML = `<circle cx="${cur.x}" cy="${cur.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
+    liveSvg.innerHTML = `<circle cx="${curS.x}" cy="${curS.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
   } else if(phase === 'B'){
     const aScreen = pendingScreen();
     liveSvg.innerHTML =
-      `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${cur.x}" y2="${cur.y}"/>
+      `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${curS.x}" y2="${curS.y}"/>
        <circle cx="${aScreen[0]}" cy="${aScreen[1]}" r="6" fill="#fff"/>`;
   }
 }
@@ -1170,7 +1177,7 @@ function onDown(e){
   if(e.touches && e.touches.length >= 2){
     e.preventDefault();
     startPinch(e);
-    phase=null; dragCorner=-1; frozenMatrix=null; grabOffset=null;
+    phase=null; dragCorner=-1; frozenMatrix=null; grabOffsetS=null;
     activeTouchId=null; hideLoupe(); drawPendingMarker();
     return;
   }
@@ -1180,12 +1187,12 @@ function onDown(e){
     activeTouchId = t ? t.identifier : null;
   }
   e.preventDefault();
-  cur = viewPoint(e);
-  if(!cur){ activeTouchId=null; return; }
+  curS = pointerScreen(e);
+  if(!curS){ activeTouchId=null; return; }
 
   if(state.mode === 'mesh'){
-    phase = pendingA ? 'B' : 'A';
-    updateLoupeFromCanvas(screenToContent(cur), cur);
+    phase = pendingImg ? 'B' : 'A';
+    updateLoupeFromCanvas(screenToContent(curS), curS);
     drawLive();
     return;
   }
@@ -1197,7 +1204,7 @@ function onDown(e){
     let best=-1, bestD=Infinity;
     state.corners.forEach((p,i)=>{
       const s = contentToScreen(matApply(M, p[0], p[1]));
-      const d = Math.hypot(s[0]-cur.x, s[1]-cur.y);
+      const d = Math.hypot(s[0]-curS.x, s[1]-curS.y);
       if(d < bestD){ bestD = d; best = i; }
     });
     if(bestD > 60){
@@ -1209,15 +1216,15 @@ function onDown(e){
     const hc = matApply(M, state.corners[best][0], state.corners[best][1]);
     const hs = contentToScreen(hc);
     // keep the handle where it is relative to the finger: no jump on grab
-    grabOffset = [ hs[0]-cur.x, hs[1]-cur.y ];
-    updateLoupe({x:hc[0], y:hc[1]}, frozenMatrix, cur);
+    grabOffsetS = [ hs[0]-curS.x, hs[1]-curS.y ];
+    updateLoupe({x:hc[0], y:hc[1]}, frozenMatrix, curS);
     drawGuides();
     return;
   }
 
-  phase = pendingA ? 'B' : 'A';
-  const curC = screenToContent(cur);
-  if(state.mode==='mesh') updateLoupeFromCanvas(curC, cur); else updateLoupe(curC, null, cur);
+  phase = pendingImg ? 'B' : 'A';
+  const curC = screenToContent(curS);
+  if(state.mode==='mesh') updateLoupeFromCanvas(curC, curS); else updateLoupe(curC, null, curS);
   drawLive();
 }
 
@@ -1225,21 +1232,21 @@ function onMove(e){
   if(pinch){ e.preventDefault(); movePinch(e); return; }
   if(dragCorner < 0 && !phase) return;
   e.preventDefault();
-  const np = viewPoint(e);
-  if(!np) return;                                // event for a different finger
-  cur = np;
+  const npS = pointerScreen(e);
+  if(!npS) return;                                // event for a different finger
+  curS = npS;
 
   if(dragCorner >= 0){
     const Minv = matInv(frozenMatrix);
     if(Minv){
-      // target position in SCREEN space -> exact 1:1 tracking, then back to image
-      const tS = {x: cur.x + grabOffset[0], y: cur.y + grabOffset[1]};
+      // targetC position in SCREEN space -> exact 1:1 tracking, then back to image
+      const tS = {x: curS.x + grabOffsetS[0], y: curS.y + grabOffsetS[1]};
       const tC = screenToContent(tS);
       const p = matApply(Minv, tC.x, tC.y);
       state.corners[dragCorner] = [ p[0], p[1] ];
       drawGuides();                   // handles move, image stays frozen
       // crosshair follows the HANDLE, bubble follows the finger
-      updateLoupe(tC, frozenMatrix, cur);
+      updateLoupe(tC, frozenMatrix, curS);
     }
     return;
   }
@@ -1247,17 +1254,17 @@ function onMove(e){
   // same conversion as onDown: the loupe needs CONTENT coordinates, the bubble
   // position needs SCREEN ones. Passing raw screen coords here made the bubble
   // show the spot the finger would be over if the view were not zoomed.
-  const curC = screenToContent(cur);
-  if(state.mode==='mesh') updateLoupeFromCanvas(curC, cur); else updateLoupe(curC, null, cur);
+  const curC = screenToContent(curS);
+  if(state.mode==='mesh') updateLoupeFromCanvas(curC, curS); else updateLoupe(curC, null, curS);
   drawLive();
 }
 // marker for a confirmed-but-not-yet-paired first point: without it you lift the
 // finger and nothing shows that the point was registered at all
 function pendingScreen(){
-  if(!pendingA) return null;
+  if(!pendingImg) return null;
   return contentToScreen(state.mode==='mesh'
-    ? lmMap(pendingA.x, pendingA.y)
-    : matApply(buildMatrix(), pendingA.x, pendingA.y));
+    ? lmMap(pendingImg.x, pendingImg.y)
+    : matApply(buildMatrix(), pendingImg.x, pendingImg.y));
 }
 function drawPendingMarker(){
   const p = pendingScreen();
@@ -1269,11 +1276,11 @@ function drawPendingMarker(){
 
 function drawLive(){
   if(phase === 'A'){
-    liveSvg.innerHTML = `<circle cx="${cur.x}" cy="${cur.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
+    liveSvg.innerHTML = `<circle cx="${curS.x}" cy="${curS.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
   } else if(phase === 'B'){
     const aScreen = pendingScreen();
     liveSvg.innerHTML =
-      `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${cur.x}" y2="${cur.y}"/>
+      `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${curS.x}" y2="${curS.y}"/>
        <circle cx="${aScreen[0]}" cy="${aScreen[1]}" r="6" fill="#fff"/>`;
   }
 }
@@ -1287,7 +1294,7 @@ function onUp(e){
   activeTouchId = null;
 
   if(dragCorner >= 0){
-    dragCorner = -1; frozenMatrix = null; grabOffset = null;
+    dragCorner = -1; frozenMatrix = null; grabOffsetS = null;
     hideLoupe(); render();            // now re-warp with the new corner
     statusEl.textContent = 'Angoli aggiornati.';
     return;
@@ -1296,16 +1303,16 @@ function onUp(e){
   liveSvg.innerHTML = ''; hideLoupe();
 
   if(phase === 'A'){
-    const cC = screenToContent(cur);
-    pendingA = state.mode==='mesh' ? lmInverse(cC.x,cC.y) : toImageSpace(cC);
+    const cC = screenToContent(curS);
+    pendingImg = state.mode==='mesh' ? lmInverse(cC.x,cC.y) : contentToImage(cC);
     phase = null;
     drawPendingMarker();
     statusEl.textContent = 'Punto iniziale fissato — tocca per posizionare il punto finale.';
   } else if(phase === 'B'){
-    const cC = screenToContent(cur);
-    const b = state.mode==='mesh' ? lmInverse(cC.x,cC.y) : toImageSpace(cC);
-    const a = pendingA;
-    pendingA = null; phase = null;
+    const cC = screenToContent(curS);
+    const b = state.mode==='mesh' ? lmInverse(cC.x,cC.y) : contentToImage(cC);
+    const a = pendingImg;
+    pendingImg = null; phase = null;
     if(Math.hypot(b.x-a.x, b.y-a.y) < 5){
       statusEl.textContent = 'Guida troppo corta, riprova.';
     } else {
@@ -1368,11 +1375,11 @@ function initCorners(){
   ];
 }
 modeSeg.addEventListener('click', e=>{
-  const b = e.target.closest('button[data-mode]'); if(!b) return;
+  const b = e.targetC.closest('button[data-mode]'); if(!b) return;
   state.mode = b.dataset.mode;
   [...modeSeg.querySelectorAll('button')].forEach(x=>x.classList.toggle('active', x===b));
   hintEl.textContent = HINTS[state.mode];
-  pendingA=null; phase=null; dragCorner=-1; liveSvg.innerHTML=''; hideLoupe();
+  pendingImg=null; phase=null; dragCorner=-1; liveSvg.innerHTML=''; hideLoupe();
   if(state.mode==='corners' && !state.corners && state.bitmap) initCorners();
 
   render();
@@ -1384,9 +1391,9 @@ modeSeg.addEventListener('click', e=>{
 });
 
 clearBtn.addEventListener('click', ()=>{
-  if(state.mode==='mesh'){ state.mlines=[]; lmSol=null; pendingA=null; phase=null; liveSvg.innerHTML=''; render(); statusEl.textContent='Linee cancellate.'; return; }
+  if(state.mode==='mesh'){ state.mlines=[]; lmSol=null; pendingImg=null; phase=null; liveSvg.innerHTML=''; render(); statusEl.textContent='Linee cancellate.'; return; }
   if(state.mode==='corners'){ initCorners(); render(); statusEl.textContent='Angoli reimpostati.'; return; }
-  state.guides.length=0; pendingA=null; phase=null; liveSvg.innerHTML=''; hideLoupe();
+  state.guides.length=0; pendingImg=null; phase=null; liveSvg.innerHTML=''; hideLoupe();
   render(); statusEl.textContent='';
 });
 
@@ -1396,7 +1403,7 @@ scaleSlider.addEventListener('input',()=>{ state.scale=+scaleSlider.value; scale
 amountSlider.addEventListener('input',()=>{ state.amount=+amountSlider.value; amountVal.textContent=Math.round(state.amount)+'%'; if(state.mode==='mesh') lmSolve(); render(); });
 
 fillSeg.addEventListener('click',e=>{
-  const b=e.target.closest('button[data-fill]'); if(!b) return;
+  const b=e.targetC.closest('button[data-fill]'); if(!b) return;
   state.fill=b.dataset.fill;
   [...fillSeg.querySelectorAll('button')].forEach(x=>x.classList.toggle('active',x===b));
   viewport.style.background = state.fill==='white' ? '#fff' : '#000';
@@ -1424,14 +1431,14 @@ function drawGrid(){
 
 /* ============================ file load ============================ */
 fileInput.addEventListener('change', async e=>{
-  const f=e.target.files&&e.target.files[0]; if(!f) return;
+  const f=e.targetC.files&&e.targetC.files[0]; if(!f) return;
   statusEl.textContent='Carico…';
   try{
     const bmp = await createImageBitmap(f,{imageOrientation:'from-image'});
     if(state.bitmap && state.bitmap.close) state.bitmap.close();
     state.bitmap = bmp; state.fullW=bmp.width; state.fullH=bmp.height;
     state.fileName=(f.name||'image').replace(/\.[^.]+$/,'');
-    state.guides.length=0; pendingA=null; phase=null; dragCorner=-1; state.corners=null;
+    state.guides.length=0; pendingImg=null; phase=null; dragCorner=-1; state.corners=null;
     state.mlines=[]; lmSol=null; lmSolver=null; state.texDirty=true; meshGL=null;
     state.zoom=1; state.pan={x:0,y:0};
     liveSvg.innerHTML=''; hideLoupe();
@@ -1652,10 +1659,11 @@ exportBtn.addEventListener('click', async ()=>{
 });
 
 async function doExport(){
-  // conjugate the view-space matrix into full-res pixel space: Hfull = S * M * S^-1
+  // conjugate the view-space matrix into full-res pixel space: Hfull = S * M * S^-1.
+  // Mesh mode carries its own geometry, so the homography is not built there.
   const s = state.fullW/state.viewW;
   const S=[s,0,0, 0,s,0, 0,0,1], Sinv=[1/s,0,0, 0,1/s,0, 0,0,1];
-  const Hfull = matMul(S, matMul(buildMatrix(), Sinv));
+  const Hfull = state.mode==='mesh' ? null : matMul(S, matMul(buildMatrix(), Sinv));
 
   statusEl.textContent='Warp a piena risoluzione…';
   let rgb;
