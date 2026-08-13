@@ -198,7 +198,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.11.4';
+const VERSION = 'v0.11.5';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -1375,7 +1375,7 @@ function initCorners(){
   ];
 }
 modeSeg.addEventListener('click', e=>{
-  const b = e.targetC.closest('button[data-mode]'); if(!b) return;
+  const b = e.target.closest('button[data-mode]'); if(!b) return;
   state.mode = b.dataset.mode;
   [...modeSeg.querySelectorAll('button')].forEach(x=>x.classList.toggle('active', x===b));
   hintEl.textContent = HINTS[state.mode];
@@ -1403,7 +1403,7 @@ scaleSlider.addEventListener('input',()=>{ state.scale=+scaleSlider.value; scale
 amountSlider.addEventListener('input',()=>{ state.amount=+amountSlider.value; amountVal.textContent=Math.round(state.amount)+'%'; if(state.mode==='mesh') lmSolve(); render(); });
 
 fillSeg.addEventListener('click',e=>{
-  const b=e.targetC.closest('button[data-fill]'); if(!b) return;
+  const b=e.target.closest('button[data-fill]'); if(!b) return;
   state.fill=b.dataset.fill;
   [...fillSeg.querySelectorAll('button')].forEach(x=>x.classList.toggle('active',x===b));
   viewport.style.background = state.fill==='white' ? '#fff' : '#000';
@@ -1431,7 +1431,7 @@ function drawGrid(){
 
 /* ============================ file load ============================ */
 fileInput.addEventListener('change', async e=>{
-  const f=e.targetC.files&&e.targetC.files[0]; if(!f) return;
+  const f=e.target.files&&e.target.files[0]; if(!f) return;
   statusEl.textContent='Carico…';
   try{
     const bmp = await createImageBitmap(f,{imageOrientation:'from-image'});
