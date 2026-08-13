@@ -198,7 +198,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.10.3';
+const VERSION = 'v0.10.4';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -1244,7 +1244,11 @@ function onMove(e){
     return;
   }
 
-  updateLoupe(cur);
+  // same conversion as onDown: the loupe needs CONTENT coordinates, the bubble
+  // position needs SCREEN ones. Passing raw screen coords here made the bubble
+  // show the spot the finger would be over if the view were not zoomed.
+  const curC = screenToContent(cur);
+  if(state.mode==='mesh') updateLoupeFromCanvas(curC, cur); else updateLoupe(curC, null, cur);
   drawLive();
 }
 // marker for a confirmed-but-not-yet-paired first point: without it you lift the
