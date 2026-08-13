@@ -198,7 +198,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.10.2';
+const VERSION = 'v0.10.3';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -742,7 +742,13 @@ function uploadLmStatic(gl,g){
 function renderMeshPreview(){
   if(!state.previewCanvas) return;
   const dpr = Math.min(window.devicePixelRatio||1, 2);
-  const W = Math.max(1,Math.round(state.viewW*dpr)), H = Math.max(1,Math.round(state.viewH*dpr));
+  // resolve at the zoom actually being displayed, capped so the backing store
+  // stays within a sane budget on phones
+  const zs = Math.min(state.zoom, 3);
+  const budget = 12e6;
+  let res = dpr*zs;
+  if(state.viewW*state.viewH*res*res > budget) res = Math.sqrt(budget/(state.viewW*state.viewH));
+  const W = Math.max(1,Math.round(state.viewW*res)), H = Math.max(1,Math.round(state.viewH*res));
   meshCanvas.style.width = state.viewW+'px';
   meshCanvas.style.height = state.viewH+'px';
   if(meshCanvas.width!==W || meshCanvas.height!==H){ meshCanvas.width=W; meshCanvas.height=H; meshGL=null; }
@@ -756,7 +762,7 @@ function renderMeshPreview(){
   gl.useProgram(g.prog);
   if(g.lmCount!==lmBufCount()) uploadLmStatic(gl,g);
   gl.bindBuffer(gl.ARRAY_BUFFER, g.vbo);
-  gl.bufferData(gl.ARRAY_BUFFER, lmPositions(dpr, meshAffine()), gl.DYNAMIC_DRAW);
+  gl.bufferData(gl.ARRAY_BUFFER, lmPositions(res, meshAffine()), gl.DYNAMIC_DRAW);
   gl.enableVertexAttribArray(g.aPos);
   gl.vertexAttribPointer(g.aPos,2,gl.FLOAT,false,0,0);
   gl.viewport(0,0,W,H);
@@ -817,6 +823,7 @@ function updateLoupeFromCanvas(target, anchor){
   loupeCtx.fillStyle='#000'; loupeCtx.fillRect(0,0,132,132);
   loupeCtx.save();
   loupeCtx.beginPath(); loupeCtx.arc(66,66,66,0,Math.PI*2); loupeCtx.clip();
+  loupeCtx.imageSmoothingEnabled = true;
   loupeCtx.drawImage(meshCanvas, target.x*dpr-r, target.y*dpr-r, 2*r, 2*r, 0,0,132,132);
   loupeCtx.restore();
   const above = anchor.y-28 > 150;
@@ -987,6 +994,7 @@ function applyPanZoom(){
   state.pan.y = Math.min(0, Math.max(minY, state.pan.y));
   panZoomEl.style.transform = `translate(${state.pan.x}px,${state.pan.y}px) scale(${z})`;
   if(pendingA && !phase) drawPendingMarker();
+  if(state.mode==='mesh' && state.bitmap) renderMeshPreview();   // re-resolve at the new zoom
   if(z > 1.01){
     zoomBadge.textContent = z.toFixed(1)+'\u00d7  \u00b7  reset';
     zoomBadge.style.display = 'block';
@@ -1094,7 +1102,10 @@ function updateLoupe(target, M, anchor){
   anchor = anchor || target;
   const Minv = matInv(M);
   if(!Minv) return;
-  const s = state.previewCanvas.width / state.viewW;
+  // sample the original image, so the bubble gains detail as you zoom in
+  const useFull = !!state.bitmap;
+  const srcImg = useFull ? state.bitmap : state.previewCanvas;
+  const s = (useFull ? state.fullW : state.previewCanvas.width) / state.viewW;
   const p0 = matApply(Minv, target.x, target.y);
   const px = matApply(Minv, target.x+1, target.y);
   const py = matApply(Minv, target.x, target.y+1);
@@ -1116,7 +1127,7 @@ function updateLoupe(target, M, anchor){
   loupeCtx.save();
   loupeCtx.beginPath(); loupeCtx.arc(66,66,66,0,Math.PI*2); loupeCtx.clip();
   loupeCtx.setTransform(K11,K21,K12,K22,tx,ty);
-  loupeCtx.drawImage(state.previewCanvas,0,0);
+  loupeCtx.drawImage(srcImg,0,0);
   loupeCtx.restore();
   loupeCtx.setTransform(1,0,0,1,0,0);
   const above = anchor.y - 28 > 150;
