@@ -198,7 +198,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.10.0';
+const VERSION = 'v0.10.2';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -642,17 +642,19 @@ function lmInverse(sx,sy){
   return {x:sx,y:sy};
 }
 
-/* ===================== mesh warp (free-form, multi-plane) =====================
+/* ===================== mesh renderer (GPU side of the line solver) ===========
    Guides and corners both rectify ONE plane, which is why they cannot fix a
    ceiling and the wall bands under it at the same time: those planes sit at
    different orientations in 3D. The mesh gives up global projective correctness
    in exchange for local control — the tool of last resort for architecture.
 
-   Control points are interpolated with bicubic Catmull-Rom, NOT bilinear
-   triangles: a piecewise-linear mesh creases visibly at cell boundaries, which
-   on straight architectural edges is immediately obvious.                     */
+   The mesh grid IS the render grid: each cell is drawn as two triangles, so the
+   interpolation the GPU performs is exactly the bilinear interpolation used when
+   assembling the line constraints. Any smoother basis here (Catmull-Rom and the
+   like) would no longer match the solver, and the lines would come out slightly
+   crooked. Smoothness comes instead from the solver's regularisation plus a grid
+   dense enough (~33 cells on the long side) that cell boundaries are invisible. */
 
-let meshUVCache = null, meshIdxCache = null;
 let meshGL = null;             // preview context, created lazily
 
 const meshCanvas = document.getElementById('meshCanvas');
@@ -984,6 +986,7 @@ function applyPanZoom(){
   state.pan.x = Math.min(0, Math.max(minX, state.pan.x));
   state.pan.y = Math.min(0, Math.max(minY, state.pan.y));
   panZoomEl.style.transform = `translate(${state.pan.x}px,${state.pan.y}px) scale(${z})`;
+  if(pendingA && !phase) drawPendingMarker();
   if(z > 1.01){
     zoomBadge.textContent = z.toFixed(1)+'\u00d7  \u00b7  reset';
     zoomBadge.style.display = 'block';
@@ -1027,6 +1030,14 @@ function movePinch(e){
   state.zoom = z;
   applyPanZoom();
 }
+
+for(const g of ['gesturestart','gesturechange','gestureend']){
+  document.addEventListener(g, e=>{ e.preventDefault(); }, {passive:false});
+}
+document.addEventListener('touchmove', e=>{
+  if(e.touches && e.touches.length>1) e.preventDefault();   // no page pinch-zoom
+}, {passive:false});
+document.addEventListener('dblclick', e=>e.preventDefault(), {passive:false});
 
 viewport.addEventListener('wheel', e=>{
   if(!state.bitmap) return;
@@ -1116,13 +1127,27 @@ function updateLoupe(target, M, anchor){
 }
 function hideLoupe(){ loupeEl.style.display = 'none'; }
 
+// marker for a confirmed-but-not-yet-paired first point: without it you lift the
+// finger and nothing shows that the point was registered at all
+function pendingScreen(){
+  if(!pendingA) return null;
+  return contentToScreen(state.mode==='mesh'
+    ? lmMap(pendingA.x, pendingA.y)
+    : matApply(buildMatrix(), pendingA.x, pendingA.y));
+}
+function drawPendingMarker(){
+  const p = pendingScreen();
+  liveSvg.innerHTML = p
+    ? `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="7" fill="#fff" stroke="rgba(0,0,0,.5)" stroke-width="2"/>`
+    + `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="14" fill="none" stroke="#fff" stroke-width="1.5" opacity=".55"/>`
+    : '';
+}
+
 function drawLive(){
   if(phase === 'A'){
     liveSvg.innerHTML = `<circle cx="${cur.x}" cy="${cur.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
   } else if(phase === 'B'){
-    const aScreen = contentToScreen(state.mode==='mesh'
-      ? lmMap(pendingA.x, pendingA.y)
-      : matApply(buildMatrix(), pendingA.x, pendingA.y));
+    const aScreen = pendingScreen();
     liveSvg.innerHTML =
       `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${cur.x}" y2="${cur.y}"/>
        <circle cx="${aScreen[0]}" cy="${aScreen[1]}" r="6" fill="#fff"/>`;
@@ -1135,7 +1160,7 @@ function onDown(e){
     e.preventDefault();
     startPinch(e);
     phase=null; dragCorner=-1; frozenMatrix=null; grabOffset=null;
-    activeTouchId=null; liveSvg.innerHTML=''; hideLoupe();
+    activeTouchId=null; hideLoupe(); drawPendingMarker();
     return;
   }
   if(e.touches){
@@ -1211,13 +1236,27 @@ function onMove(e){
   updateLoupe(cur);
   drawLive();
 }
+// marker for a confirmed-but-not-yet-paired first point: without it you lift the
+// finger and nothing shows that the point was registered at all
+function pendingScreen(){
+  if(!pendingA) return null;
+  return contentToScreen(state.mode==='mesh'
+    ? lmMap(pendingA.x, pendingA.y)
+    : matApply(buildMatrix(), pendingA.x, pendingA.y));
+}
+function drawPendingMarker(){
+  const p = pendingScreen();
+  liveSvg.innerHTML = p
+    ? `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="7" fill="#fff" stroke="rgba(0,0,0,.5)" stroke-width="2"/>`
+    + `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="14" fill="none" stroke="#fff" stroke-width="1.5" opacity=".55"/>`
+    : '';
+}
+
 function drawLive(){
   if(phase === 'A'){
     liveSvg.innerHTML = `<circle cx="${cur.x}" cy="${cur.y}" r="7" fill="none" stroke="#fff" stroke-width="2"/>`;
   } else if(phase === 'B'){
-    const aScreen = contentToScreen(state.mode==='mesh'
-      ? lmMap(pendingA.x, pendingA.y)
-      : matApply(buildMatrix(), pendingA.x, pendingA.y));
+    const aScreen = pendingScreen();
     liveSvg.innerHTML =
       `<line x1="${aScreen[0]}" y1="${aScreen[1]}" x2="${cur.x}" y2="${cur.y}"/>
        <circle cx="${aScreen[0]}" cy="${aScreen[1]}" r="6" fill="#fff"/>`;
@@ -1245,6 +1284,7 @@ function onUp(e){
     const cC = screenToContent(cur);
     pendingA = state.mode==='mesh' ? lmInverse(cC.x,cC.y) : toImageSpace(cC);
     phase = null;
+    drawPendingMarker();
     statusEl.textContent = 'Punto iniziale fissato — tocca per posizionare il punto finale.';
   } else if(phase === 'B'){
     const cC = screenToContent(cur);
