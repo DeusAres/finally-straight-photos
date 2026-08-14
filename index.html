@@ -87,7 +87,12 @@
     -webkit-backdrop-filter:blur(20px) saturate(1.4);
     border-top:1px solid var(--line);border-radius:var(--r-lg) var(--r-lg) 0 0;
     margin-top:-14px;position:relative;z-index:1;
-    padding:14px 14px calc(12px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:11px;}
+    padding:10px 14px calc(10px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:9px;}
+  #trayExtra{display:flex;flex-direction:column;gap:11px;overflow:hidden;
+    max-height:400px;opacity:1;transition:max-height .28s ease,opacity .2s ease;}
+  #tray.collapsed #trayExtra{max-height:0;opacity:0;pointer-events:none;}
+  #trayEssential{margin:0;}
+  #collapseBtn{margin-left:auto;font-size:12px;padding:9px 10px;}
   .row{display:flex;align-items:center;gap:11px;}
   .row label{font-size:12px;color:var(--dim);width:56px;flex:0 0 auto;font-weight:500;}
   .row .val{font-size:12px;color:var(--fg);width:48px;text-align:right;font-variant-numeric:tabular-nums;font-weight:600;}
@@ -155,23 +160,7 @@
 </div>
 
 <div id="tray">
-  <div class="row">
-    <label>Rotazione</label>
-    <input type="range" id="rotSlider" min="-15" max="15" step="0.05" value="0">
-    <div class="val" id="rotVal">0.0°</div>
-  </div>
-  <div class="row">
-    <label>Scala</label>
-    <input type="range" id="scaleSlider" min="100" max="220" step="0.5" value="100">
-    <div class="val" id="scaleVal">100%</div>
-  </div>
-  <div class="row">
-    <label>Intensità</label>
-    <input type="range" id="amountSlider" min="0" max="100" step="1" value="100">
-    <div class="val" id="amountVal">100%</div>
-  </div>
-
-  <div class="toolbar">
+  <div class="toolbar" id="trayEssential">
     <div class="segmented" id="modeSeg">
       <button data-mode="guides" class="active">Guide</button>
       <button data-mode="corners">Angoli</button>
@@ -179,16 +168,37 @@
     </div>
     <label class="fileBtn" for="fileInput">📷 Apri</label>
     <input type="file" id="fileInput" accept="image/*">
-    <button id="undoBtn" disabled>↩︎ Ultima guida</button>
-    <button id="clearBtn" disabled>Cancella guide</button>
-    <button id="gridBtn" class="toggled">Griglia: terzi</button>
-    <div class="segmented" id="fillSeg">
-      <button data-fill="white" class="active">Bianco</button>
-      <button data-fill="black">Nero</button>
-    </div>
     <button id="exportBtn" class="primary" disabled>Esporta JPEG</button>
+    <button id="collapseBtn" aria-expanded="true">Controlli ▾</button>
   </div>
-  <div class="hint">Tocca e trascina per posizionare il punto (usa la loupe), rilascia per confermare — poi ripeti per il punto finale. Verde = verticale, giallo = orizzontale. Fino a 4 per direzione (oltre 2 → stima ai minimi quadrati).</div>
+
+  <div id="trayExtra">
+    <div class="row">
+      <label>Rotazione</label>
+      <input type="range" id="rotSlider" min="-15" max="15" step="0.05" value="0">
+      <div class="val" id="rotVal">0.0°</div>
+    </div>
+    <div class="row">
+      <label>Scala</label>
+      <input type="range" id="scaleSlider" min="100" max="220" step="0.5" value="100">
+      <div class="val" id="scaleVal">100%</div>
+    </div>
+    <div class="row">
+      <label>Intensità</label>
+      <input type="range" id="amountSlider" min="0" max="100" step="1" value="100">
+      <div class="val" id="amountVal">100%</div>
+    </div>
+    <div class="toolbar">
+      <button id="undoBtn" disabled>↩︎ Ultima guida</button>
+      <button id="clearBtn" disabled>Cancella guide</button>
+      <button id="gridBtn" class="toggled">Griglia: terzi</button>
+      <div class="segmented" id="fillSeg">
+        <button data-fill="white" class="active">Bianco</button>
+        <button data-fill="black">Nero</button>
+      </div>
+    </div>
+    <div class="hint">Tocca e trascina per posizionare il punto (usa la loupe), rilascia per confermare — poi ripeti per il punto finale. Verde = verticale, giallo = orizzontale. Fino a 4 per direzione (oltre 2 → stima ai minimi quadrati).</div>
+  </div>
   <div id="status"></div>
 </div>
 
@@ -198,7 +208,7 @@
 (function(){
 'use strict';
 
-const VERSION = 'v0.11.5';
+const VERSION = 'v0.12.0';
 const MAX_PER_DIR = 4;  // >2 per direction switches the vanishing point to least-squares
 document.getElementById('versionBadge').textContent = VERSION;
 
@@ -991,6 +1001,8 @@ function drawGuides(){
    content coordinates before any hit-test or inverse mapping. */
 const panZoomEl = document.getElementById('panZoom');
 const zoomBadge = document.getElementById('zoomBadge');
+const trayEl = document.getElementById('tray');
+const collapseBtn = document.getElementById('collapseBtn');
 const MIN_ZOOM = 1, MAX_ZOOM = 8;
 
 function applyPanZoom(){
@@ -1022,6 +1034,22 @@ function zoomAt(screenPt, newZoom){
 }
 function resetView(){ state.zoom=1; state.pan={x:0,y:0}; applyPanZoom(); }
 zoomBadge.addEventListener('click', e=>{ e.stopPropagation(); resetView(); });
+
+// Collapsible controls: the sliders/hint/secondary toolbar are the least-used
+// surface once guides are placed, and reclaiming that height is the biggest
+// single lever for giving the canvas more room on a phone screen. Collapsed
+// state is read back from the DOM class rather than duplicated in a variable.
+function setTrayCollapsed(v){
+  trayEl.classList.toggle('collapsed', v);
+  collapseBtn.textContent = v ? 'Controlli ▸' : 'Controlli ▾';
+  collapseBtn.setAttribute('aria-expanded', String(!v));
+  // #stage only reaches its final size once the CSS transition finishes, so the
+  // viewport is resized at both ends of it rather than once at the wrong moment
+  layout();
+  clearTimeout(setTrayCollapsed._t);
+  setTrayCollapsed._t = setTimeout(layout, 300);
+}
+collapseBtn.addEventListener('click', ()=> setTrayCollapsed(!trayEl.classList.contains('collapsed')));
 
 let pinch = null;
 function touchPair(e){
